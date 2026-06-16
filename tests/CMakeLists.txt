@@ -1,4 +1,4 @@
-find_package(GTest QUIET)
+find_package(GTest CONFIG QUIET)
 
 if(NOT GTest_FOUND)
   include(FetchContent)

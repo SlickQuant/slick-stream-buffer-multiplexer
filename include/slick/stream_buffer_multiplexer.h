@@ -15,11 +15,13 @@
 #include <slick/queue.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -204,28 +206,24 @@ public:
     }
 
     bool has_producer(uint32_t producer_id) const noexcept {
-        return producer_id < producers_.size() && producers_[producer_id] != nullptr;
+        return find_producer(producer_id) != nullptr;
     }
 
     /// Shared-ownership handle to a producer_buffer, so it (and its stream_buffer
     /// and shared record queue references) can outlive this stream_buffer_multiplexer.
     /// Returns nullptr if producer_id is unregistered (or out of range) on this instance.
     std::shared_ptr<producer_buffer> get_producer_buffer(uint32_t producer_id) {
-        if (!has_producer(producer_id)) {
-            return nullptr;
-        }
-        return producers_[producer_id];
+        auto it = producers_.find(producer_id);
+        return it == producers_.end() ? nullptr : it->second;
     }
 
     std::shared_ptr<const producer_buffer> get_producer_buffer(uint32_t producer_id) const {
-        if (!has_producer(producer_id)) {
-            return nullptr;
-        }
-        return producers_[producer_id];
+        auto it = producers_.find(producer_id);
+        return it == producers_.end() ? nullptr : it->second;
     }
 
-    /// Number of producer_id slots allocated so far (may include unregistered/nullptr gaps).
-    size_t producer_slot_count() const noexcept { return producers_.size(); }
+    /// Number of registered producers on this multiplexer instance.
+    size_t producer_count() const noexcept { return producers_.size(); }
 
     // ------------------------------------------------------------------
     // Consumer side
@@ -237,23 +235,7 @@ public:
      * @return The next message (data, length, producer_id), or a falsy multiplex_record if none is available.
      */
     multiplex_record read(uint64_t& cursor) noexcept {
-        for (;;) {
-            auto [rec, n] = shared_queue_->read(cursor);
-            (void)n;
-            if (rec == nullptr) {
-                return {};
-            }
-            const record copy = *rec;
-            if (!has_producer(copy.producer_id)) {
-                continue;  // not registered on this instance: intentionally ignored, not loss
-            }
-            if (auto result = dereference(copy)) {
-                return result;
-            }
-#if SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION
-            loss_count_.fetch_add(1, std::memory_order_relaxed);
-#endif
-        }
+        return read_impl(cursor);
     }
 
     /**
@@ -262,23 +244,7 @@ public:
      * @return The next message (data, length, producer_id), or a falsy multiplex_record if none is available.
      */
     multiplex_record read(std::atomic<uint64_t>& cursor) noexcept {
-        for (;;) {
-            auto [rec, n] = shared_queue_->read(cursor);
-            (void)n;
-            if (rec == nullptr) {
-                return {};
-            }
-            const record copy = *rec;
-            if (!has_producer(copy.producer_id)) {
-                continue;  // not registered on this instance: intentionally ignored, not loss
-            }
-            if (auto result = dereference(copy)) {
-                return result;
-            }
-#if SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION
-            loss_count_.fetch_add(1, std::memory_order_relaxed);
-#endif
-        }
+        return read_impl(cursor);
     }
 
     /// Shared-queue wrap loss plus multiplexer-level loss (shared-queue entries whose
@@ -300,30 +266,76 @@ public:
     }
 
 private:
+    static constexpr size_t dense_lookup_limit_ = 4096;
+
     std::shared_ptr<producer_buffer> add_producer_impl(uint32_t producer_id, std::shared_ptr<slick::stream_buffer> buffer) {
         if (has_producer(producer_id)) {
             throw std::invalid_argument("producer_id " + std::to_string(producer_id) + " already registered");
         }
-        if (producer_id >= producers_.size()) {
-            producers_.resize(producer_id + 1);
+        auto producer = std::shared_ptr<producer_buffer>(
+            new producer_buffer(producer_id, shared_queue_, std::move(buffer)));
+        producers_.emplace(producer_id, producer);
+
+        if (producer_id < dense_lookup_limit_) {
+            const size_t slot = static_cast<size_t>(producer_id);
+            if (slot >= dense_producers_.size()) {
+                dense_producers_.resize(slot + 1, nullptr);
+            }
+            dense_producers_[slot] = producer.get();
         }
-        producers_[producer_id].reset(new producer_buffer(producer_id, shared_queue_, std::move(buffer)));
-        return producers_[producer_id];
+
+        return producer;
     }
 
     /// Dereference a shared-queue record into the matching producer's stream_buffer.
     /// Returns a falsy multiplex_record if the record has been lapped before being
     /// dereferenced. Caller must ensure has_producer(rec.producer_id) is true.
-    multiplex_record dereference(const record& rec) noexcept {
+    multiplex_record dereference(producer_buffer& producer, const record& rec) noexcept {
         uint64_t local_cursor = rec.sequence;
-        auto [data, length] = producers_[rec.producer_id]->stream_buffer().read(local_cursor);
+        auto [data, length] = producer.stream_buffer().read(local_cursor);
         if (data != nullptr && local_cursor == rec.sequence + 1) {
             return { data, length, rec.producer_id };
         }
         return {};
     }
 
-    std::vector<std::shared_ptr<producer_buffer>> producers_;
+    producer_buffer* find_producer(uint32_t producer_id) noexcept {
+        return const_cast<producer_buffer*>(std::as_const(*this).find_producer(producer_id));
+    }
+
+    const producer_buffer* find_producer(uint32_t producer_id) const noexcept {
+        if (producer_id < dense_producers_.size()) {
+            return dense_producers_[producer_id];
+        }
+        auto it = producers_.find(producer_id);
+        return it == producers_.end() ? nullptr : it->second.get();
+    }
+
+    template <typename Cursor>
+    multiplex_record read_impl(Cursor& cursor) noexcept {
+        for (;;) {
+            auto [rec, n] = shared_queue_->read(cursor);
+            (void)n;
+            if (rec == nullptr) {
+                return {};
+            }
+
+            const record copy = *rec;
+            auto* producer = find_producer(copy.producer_id);
+            if (producer == nullptr) {
+                continue;  // not registered on this instance: intentionally ignored, not loss
+            }
+            if (auto result = dereference(*producer, copy)) {
+                return result;
+            }
+#if SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION
+            loss_count_.fetch_add(1, std::memory_order_relaxed);
+#endif
+        }
+    }
+
+    std::unordered_map<uint32_t, std::shared_ptr<producer_buffer>> producers_;
+    std::vector<producer_buffer*> dense_producers_;
     std::shared_ptr<slick::queue<record>> shared_queue_;
 #if SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION
     std::atomic<uint64_t> loss_count_{0};

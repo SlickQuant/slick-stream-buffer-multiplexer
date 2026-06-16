@@ -37,7 +37,7 @@ void take_stream_buffer(slick::stream_buffer&) {}
 TEST(MultiplexerTests, EmptyMultiplexerReadReturnsFalsy) {
     stream_buffer_multiplexer mux(64);
 
-    EXPECT_EQ(mux.producer_slot_count(), 0u);
+    EXPECT_EQ(mux.producer_count(), 0u);
     EXPECT_EQ(mux.initial_reading_index(), 0u);
     EXPECT_EQ(mux.loss_count(), 0u);
 
@@ -77,7 +77,7 @@ TEST(MultiplexerTests, MultipleProducersNonContiguousIds) {
     auto p0 = mux.add_producer(0, 1024, 16);
     auto p2 = mux.add_producer(2, 2048, 32);
 
-    EXPECT_EQ(mux.producer_slot_count(), 3u);
+    EXPECT_EQ(mux.producer_count(), 2u);
     EXPECT_TRUE(mux.has_producer(0));
     EXPECT_FALSE(mux.has_producer(1));
     EXPECT_TRUE(mux.has_producer(2));

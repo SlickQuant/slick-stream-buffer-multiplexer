@@ -35,3 +35,13 @@ All notable changes to this project will be documented in this file.
 - Shared memory (IPC) support with `producer_id` <-> shm-name mapping by caller
   convention; unregistered producer ids on a consumer instance are silently
   skipped rather than treated as an error or counted as loss.
+
+### Changed
+
+- Replaced the confusing `producer_slot_count()` API with
+  `producer_count()`, which now returns the actual number of registered
+  producers.
+- Optimized producer lookup with a dense fast path for low `producer_id`
+  values while still supporting sparse registrations through a fallback map.
+- Clarified in the README that contiguous `producer_id` values, ideally
+  starting at `0`, provide the best lookup performance.

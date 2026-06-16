@@ -175,6 +175,11 @@ of range or unregistered on a given multiplexer instance are silently skipped
 (not counted as loss) - this is how a consumer naturally ignores producers it
 doesn't (or can't) open.
 
+For best performance, assign `producer_id` values contiguously starting at `0`
+whenever practical. The multiplexer keeps low ids on a dense lookup fast path;
+sparse or high `producer_id` values are still supported, but may fall back to a
+slower hash lookup.
+
 ## API Overview
 
 ### `stream_buffer_multiplexer`
@@ -192,7 +197,7 @@ std::shared_ptr<producer_buffer> add_producer(uint32_t producer_id, const char* 
 
 bool has_producer(uint32_t producer_id) const noexcept;
 std::shared_ptr<producer_buffer> get_producer_buffer(uint32_t producer_id); // shared ownership; nullptr if unregistered
-size_t producer_slot_count() const noexcept;
+size_t producer_count() const noexcept; // number of registered producers
 
 multiplex_record read(uint64_t& cursor) noexcept;
 multiplex_record read(std::atomic<uint64_t>& cursor) noexcept;  // work-stealing
@@ -268,6 +273,10 @@ called from one thread, same as `slick::stream_buffer`. Different
 
 **`add_producer` is single-threaded setup only.** Register all producers before
 starting any producer or consumer threads.
+
+**`producer_id` layout affects lookup cost.** For the fastest `read()` path,
+prefer contiguous `producer_id` values starting at `0`. Sparse or high ids are
+valid, but can miss the dense lookup fast path and use a hash lookup instead.
 
 **Message size** is limited to < 4 GiB per record.
 
