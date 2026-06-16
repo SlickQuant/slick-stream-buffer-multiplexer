@@ -48,8 +48,8 @@ returning a zero-copy view directly into that producer's ring.
 
 - **Lock-free** MPMC fan-in of N independently-sized byte streams
 - Each producer keeps **zero-copy** `(data, length, producer_id)` semantics
-- Per-producer `.stream_buffer()` accessor returns a literal `slick::stream_buffer&`,
-  so each producer is a drop-in [slick::dynamic_buffer](https://github.com/SlickQuant/slick-dynamic-buffer) target
+- Each `producer_buffer` satisfies the `slick::dynamic_buffer` buffer concept and is a drop-in
+  [`slick::dynamic_buffer<slick::stream_buffer_multiplexer::producer_buffer>`](https://github.com/SlickQuant/slick-dynamic-buffer) target
 - **Mix local-memory and shared-memory producers** under one multiplexer
 - **Shared memory support** for inter-process communication
 - **Cross-platform** - Windows, Linux, macOS
