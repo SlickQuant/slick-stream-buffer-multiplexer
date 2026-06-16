@@ -24,8 +24,9 @@ jobs:
         run: |
           if [ -f CHANGELOG.md ]; then
             VERSION="${{ github.ref_name }}"
-            VERSION_ESCAPED=$(echo "$VERSION" | sed 's/\./\\./g')
-            CHANGES=$(awk "BEGIN{p=0} /^## $VERSION_ESCAPED( |$)/{p=1;next} /^## /{p=0} p" CHANGELOG.md | sed '/^$/d')
+            VERSION_NUM="${VERSION#v}"
+            VERSION_ESCAPED=$(echo "$VERSION_NUM" | sed 's/\./\\./g')
+            CHANGES=$(awk "BEGIN{p=0} /^## \[$VERSION_ESCAPED\]/{p=1;next} /^## /{p=0} p" CHANGELOG.md | sed '/^$/d')
 
             if [ -z "$CHANGES" ]; then
               echo "CHANGELOG_CONTENT=No changelog entry found for this version." >> $GITHUB_OUTPUT
