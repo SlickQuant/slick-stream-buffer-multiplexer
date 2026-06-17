@@ -3,7 +3,7 @@
 # Find dependencies
 include(CMakeFindDependencyMacro)
 
-find_dependency(slick-stream-buffer 1.0.4 QUIET)
+find_dependency(slick-stream-buffer 1.0.5 QUIET)
 if (NOT slick-stream-buffer_FOUND)
     include(FetchContent)
 
@@ -11,7 +11,7 @@ if (NOT slick-stream-buffer_FOUND)
     FetchContent_Declare(
         slick-stream-buffer
         GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer.git
-        GIT_TAG v1.0.4
+        GIT_TAG v1.0.5
     )
     FetchContent_MakeAvailable(slick-stream-buffer)
 endif()
