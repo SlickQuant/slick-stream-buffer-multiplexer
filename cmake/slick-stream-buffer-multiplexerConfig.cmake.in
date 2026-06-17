@@ -3,7 +3,7 @@
 # Find dependencies
 include(CMakeFindDependencyMacro)
 
-find_dependency(slick-stream-buffer 1.0.5 QUIET)
+find_dependency(slick-stream-buffer 1.0.5 CONFIG QUIET)
 if (NOT slick-stream-buffer_FOUND)
     include(FetchContent)
 
@@ -16,7 +16,7 @@ if (NOT slick-stream-buffer_FOUND)
     FetchContent_MakeAvailable(slick-stream-buffer)
 endif()
 
-find_dependency(slick-queue 1.5.0 QUIET)
+find_dependency(slick-queue 1.5.0 CONFIG QUIET)
 if (NOT slick-queue_FOUND)
     include(FetchContent)
 
