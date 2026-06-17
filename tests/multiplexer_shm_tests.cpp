@@ -10,7 +10,7 @@
  ********************************************************************************/
 
 #include <gtest/gtest.h>
-#include <slick/stream_buffer_multiplexer.h>
+#include <slick/stream_buffer_multiplexer.hpp>
 
 #include <cstring>
 #include <stdexcept>

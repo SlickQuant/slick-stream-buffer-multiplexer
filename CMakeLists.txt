@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(slick-stream-buffer-multiplexer
-        VERSION 1.0.0
+        VERSION 1.0.1
         DESCRIPTION "A C++ lock-free MPMC byte stream buffer multiplexer"
         LANGUAGES CXX)
 
@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD 20)
 # Options:
 option(BUILD_SLICK_STREAM_BUFFER_MULTIPLEXER_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
-find_package(slick-stream-buffer 1.0.4 CONFIG QUIET)
+find_package(slick-stream-buffer 1.0.5 CONFIG QUIET)
 
 if (NOT slick-stream-buffer_FOUND)
     include(FetchContent)
@@ -20,7 +20,7 @@ if (NOT slick-stream-buffer_FOUND)
     FetchContent_Declare(
         slick-stream-buffer
         GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer.git
-        GIT_TAG v1.0.4 # See https://github.com/SlickQuant/slick-stream-buffer/releases for latest version
+        GIT_TAG v1.0.5 # See https://github.com/SlickQuant/slick-stream-buffer/releases for latest version
     )
     FetchContent_MakeAvailable(slick-stream-buffer)
 else()

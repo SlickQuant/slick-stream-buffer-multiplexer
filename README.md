@@ -66,7 +66,7 @@ returning a zero-copy view directly into that producer's ring.
 Header-only. Add the `include` directory to your include path:
 
 ```cpp
-#include <slick/stream_buffer_multiplexer.h>
+#include <slick/stream_buffer_multiplexer.hpp>
 ```
 
 ### Using CMake FetchContent
@@ -90,7 +90,7 @@ target_link_libraries(your_target PRIVATE slick::stream_buffer_multiplexer)
 ### Registering producers and publishing
 
 ```cpp
-#include <slick/stream_buffer_multiplexer.h>
+#include <slick/stream_buffer_multiplexer.hpp>
 
 // shared record queue: 1024 slots (must be power of 2), local memory
 slick::stream_buffer_multiplexer mux(1024);
