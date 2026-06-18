@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Expose `find_producer()` functions
+- Added Doxygen documentation for the `find_producer()` overloads.
+
 ## [1.0.1] - 2026-06-17
 
 - Renamed canonical header from slick/stream_buffer_multiplexer.h to slick/stream_buffer_multiplexer.hpp. The old .h path is kept as a backward-compatibility shim that re-exports the new header and emits a compiler warning directing users to update their includes.

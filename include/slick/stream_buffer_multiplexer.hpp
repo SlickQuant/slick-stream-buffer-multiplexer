@@ -265,6 +265,28 @@ public:
         return shared_queue_->initial_reading_index();
     }
 
+    /**
+     * @brief Find a registered producer by id.
+     * @param producer_id Producer id to look up.
+     * @return Non-owning pointer to the producer, or nullptr if producer_id is unregistered.
+     */
+    producer_buffer* find_producer(uint32_t producer_id) noexcept {
+        return const_cast<producer_buffer*>(std::as_const(*this).find_producer(producer_id));
+    }
+
+    /**
+     * @brief Find a registered producer by id.
+     * @param producer_id Producer id to look up.
+     * @return Non-owning pointer to the producer, or nullptr if producer_id is unregistered.
+     */
+    const producer_buffer* find_producer(uint32_t producer_id) const noexcept {
+        if (producer_id < dense_producers_.size()) {
+            return dense_producers_[producer_id];
+        }
+        auto it = producers_.find(producer_id);
+        return it == producers_.end() ? nullptr : it->second.get();
+    }
+
 private:
     static constexpr size_t dense_lookup_limit_ = 4096;
 
@@ -297,18 +319,6 @@ private:
             return { data, length, rec.producer_id };
         }
         return {};
-    }
-
-    producer_buffer* find_producer(uint32_t producer_id) noexcept {
-        return const_cast<producer_buffer*>(std::as_const(*this).find_producer(producer_id));
-    }
-
-    const producer_buffer* find_producer(uint32_t producer_id) const noexcept {
-        if (producer_id < dense_producers_.size()) {
-            return dense_producers_[producer_id];
-        }
-        auto it = producers_.find(producer_id);
-        return it == producers_.end() ? nullptr : it->second.get();
     }
 
     template <typename Cursor>
