@@ -12,23 +12,22 @@
 #include <gtest/gtest.h>
 #include <slick/stream_buffer_multiplexer.hpp>
 
+#include "multiplexer_test_support.hpp"
+
 #include <atomic>
 #include <cstring>
+#include <memory>
+#include <new>
+#include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 using slick::stream_buffer_multiplexer;
+using mux_test::counting_multiplexer;
+using mux_test::counting_read_traits;
+using mux_test::publish_message;
 
 namespace {
-
-// prepare + write + commit + consume in one step
-void publish_message(stream_buffer_multiplexer::producer_buffer& pb, const void* src, std::size_t n) {
-    auto [ptr, sz] = pb.prepare(n);
-    ASSERT_NE(ptr, nullptr);
-    ASSERT_GE(sz, n);
-    std::memcpy(ptr, src, n);
-    pb.commit(n);
-    pb.consume(n);
-}
 
 void take_stream_buffer(slick::stream_buffer&) {}
 
@@ -202,4 +201,169 @@ TEST(MultiplexerTests, StreamBufferPtrAccessorTypeCompat) {
     ASSERT_NE(sp, nullptr);
     EXPECT_EQ(sp.get(), &p0->stream_buffer());
     EXPECT_GT(sp.use_count(), 1);  // shared with producer_buffer's own copy
+}
+
+// --------------------------------------------------------------------------------------------
+// v2.0.0: the configuration moved from macros to a Traits template parameter
+// --------------------------------------------------------------------------------------------
+
+// The old SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION gated a std::atomic member of a
+// header-only class, so sizeof() disagreed across a -DNDEBUG boundary and two translation units
+// silently shared one definition. As a template argument the configuration is part of the type,
+// so the same disagreement cannot compile through: these are different types.
+TEST(MultiplexerTraitsTests, ConfigurationIsPartOfTheType) {
+    static_assert(!std::is_same_v<counting_multiplexer, mux_test::silent_multiplexer>,
+                  "differently-configured multiplexers must be different types");
+    static_assert(std::is_same_v<stream_buffer_multiplexer,
+                                 slick::basic_stream_buffer_multiplexer<slick::default_queue_traits>>,
+                  "the plain name must alias the default configuration");
+
+    // The counter is an unconditional member, so the layout does not vary with the configuration
+    // at all - what varies is read()'s body. Either way sizeof no longer changes behind one name
+    // across a -DNDEBUG boundary, which is what the old macro got wrong.
+    EXPECT_EQ(sizeof(mux_test::silent_multiplexer), sizeof(counting_multiplexer));
+}
+
+// The record type is shared, not per-configuration: two differently-configured multiplexers have
+// to agree on the element type of a shared record queue they both map.
+TEST(MultiplexerTraitsTests, RecordTypeIsIndependentOfTraits) {
+    static_assert(std::is_same_v<counting_multiplexer::record, mux_test::silent_multiplexer::record>,
+                  "the shared-queue element type must not depend on Traits");
+    static_assert(std::is_same_v<counting_multiplexer::record, slick::multiplexer_record>, "");
+    static_assert(std::is_same_v<stream_buffer_multiplexer::multiplex_record, slick::multiplex_record>, "");
+    EXPECT_EQ(sizeof(slick::multiplexer_record), 16u);
+}
+
+// Both loss terms are opt-in now. Records are skipped correctly either way; only the counter is
+// silent - so the same run reports 6 with counting on and 0 with it off.
+TEST(MultiplexerTraitsTests, LossCountersAreOptIn) {
+    counting_multiplexer counting(64);
+    auto cp = counting.add_producer(0, 1024, 4);   // tiny control ring: laps after 4 records
+    mux_test::publish_bytes(*cp, 10);
+
+    mux_test::silent_multiplexer silent(64);
+    auto sp = silent.add_producer(0, 1024, 4);
+    mux_test::publish_bytes(*sp, 10);
+
+    auto drain = [](auto& mux) {
+        std::vector<uint8_t> values;
+        uint64_t cursor = 0;
+        for (;;) {
+            auto rec = mux.read(cursor);
+            if (!rec) break;
+            values.push_back(rec.data[0]);
+        }
+        return values;
+    };
+
+    const std::vector<uint8_t> expected{6, 7, 8, 9};
+    EXPECT_EQ(drain(counting), expected);
+    EXPECT_EQ(drain(silent), expected);  // identical delivery...
+
+    EXPECT_EQ(counting.loss_count(), 6u);  // ...but only one of them says so
+    EXPECT_EQ(silent.loss_count(), 0u);
+}
+
+// The multiplexer dereferences by jumping a fresh cursor to one exact sequence, where read()'s own
+// count_loss would add the whole "how far has the producer run past this record" gap on every
+// lapped dereference and double-count wildly. So it counts one loss per lapped record itself and
+// leaves the producer's counter alone: the two numbers measure different things.
+TEST(MultiplexerTraitsTests, DereferenceDoesNotTouchProducerLossCount) {
+    counting_multiplexer mux(64);
+    auto p0 = mux.add_producer(0, 1024, 4);
+    mux_test::publish_bytes(*p0, 10);
+
+    uint64_t cursor = 0;
+    while (mux.read(cursor)) {
+    }
+
+    EXPECT_EQ(mux.loss_count(), 6u);     // six records lapped before they could be dereferenced
+    EXPECT_EQ(p0->loss_count(), 0u);     // the inner counter is the caller's to drive, not ours
+}
+
+// ...and it is still driveable, but it answers a different question, which is why the multiplexer
+// keeps its own. Over the identical ring - 10 records through a 4-slot control ring - a sequential
+// scan lands on slot 0, finds seq 8 in it, and jumps the cursor straight there: it skips 8 and
+// recovers only {8, 9}. The multiplexer instead asks each shared-queue record for its own exact
+// sequence, so it recovers all four records still resident, {6, 7, 8, 9}, and loses 6. Both counts
+// are right for what they measure - which is exactly why adding read()'s number to a jump-read
+// would be meaningless.
+TEST(MultiplexerTraitsTests, ProducerLossCountMovesForACountingScan) {
+    counting_multiplexer mux(64);
+    auto p0 = mux.add_producer(0, 1024, 4);
+    mux_test::publish_bytes(*p0, 10);
+
+    std::vector<uint8_t> scanned;
+    uint64_t cursor = 0;
+    for (;;) {
+        auto [data, length] = p0->stream_buffer().read<counting_read_traits>(cursor);
+        if (data == nullptr) break;
+        scanned.push_back(data[0]);
+    }
+    EXPECT_EQ(scanned, (std::vector<uint8_t>{8, 9}));
+    EXPECT_EQ(p0->loss_count(), 8u);
+
+    std::vector<uint8_t> dereferenced;
+    uint64_t mux_cursor = 0;
+    for (;;) {
+        auto rec = mux.read(mux_cursor);
+        if (!rec) break;
+        dereferenced.push_back(rec.data[0]);
+    }
+    EXPECT_EQ(dereferenced, (std::vector<uint8_t>{6, 7, 8, 9}));
+    EXPECT_EQ(mux.loss_count(), 6u);
+
+    // The default read traits do not count, which is a semantic difference and not just a speed
+    // one: the same scan on a fresh producer skips the same records and reports nothing.
+    auto p1 = mux.add_producer(1, 1024, 4);
+    mux_test::publish_bytes(*p1, 10);
+    uint64_t plain_cursor = 0;
+    while (p1->stream_buffer().read(plain_cursor).first != nullptr) {
+    }
+    EXPECT_EQ(p1->loss_count(), 0u);
+}
+
+// --------------------------------------------------------------------------------------------
+// v2.0.0: consume() reports an oversized record instead of truncating it
+// --------------------------------------------------------------------------------------------
+
+// A record's length field is 32 bits. Release used to cast the length down and publish a wrong
+// one; now consume() throws before any state moves - which for the multiplexer must also mean
+// nothing was fanned into the shared record queue.
+TEST(MultiplexerTests, OversizedConsumeThrowsAndPublishesNothing) {
+    constexpr bool kSizeTHoldsFourGiB = sizeof(std::size_t) > 4;
+    if (!kSizeTHoldsFourGiB) {
+        GTEST_SKIP() << "a 4 GiB ring cannot be addressed on a 32-bit build";
+    }
+    constexpr uint64_t kCapacity = 1ull << 32;  // 4 GiB ring - pages stay untouched below
+    constexpr uint64_t kMaxRecord = 0xFFFFFFFFull;
+
+    stream_buffer_multiplexer mux(64);
+    std::shared_ptr<stream_buffer_multiplexer::producer_buffer> p0;
+    try {
+        p0 = mux.add_producer(0, kCapacity, 16);
+    } catch (const std::bad_alloc&) {
+        GTEST_SKIP() << "not enough memory for a 4 GiB ring";
+    }
+
+    auto [ptr, sz] = p0->prepare(kCapacity);
+    ASSERT_NE(ptr, nullptr);
+    p0->commit(kCapacity);
+    ASSERT_EQ(p0->size(), kCapacity);
+
+    EXPECT_THROW(p0->consume(kCapacity), std::length_error);
+
+    // Nothing published in either ring, and the bytes are still there to publish in pieces that fit.
+    EXPECT_EQ(p0->size(), kCapacity);
+    uint64_t cursor = 0;
+    EXPECT_FALSE(mux.read(cursor));
+
+    const auto rec = p0->consume(kMaxRecord);  // the largest record that fits, exactly
+    ASSERT_TRUE(static_cast<bool>(rec));
+    EXPECT_EQ(rec.length, kMaxRecord);
+
+    auto delivered = mux.read(cursor);
+    ASSERT_TRUE(delivered);
+    EXPECT_EQ(delivered.length, kMaxRecord);
+    EXPECT_EQ(delivered.producer_id, 0u);
 }

@@ -1,16 +1,16 @@
-cmake_minimum_required(VERSION 3.10)
+# 3.21 is the real floor: PROJECT_IS_TOP_LEVEL below is 3.21+, and FetchContent_MakeAvailable
+# is 3.14+. It also matches the floor slick-stream-buffer and slick-queue now state.
+cmake_minimum_required(VERSION 3.21)
 
 project(slick-stream-buffer-multiplexer
-        VERSION 1.0.1
+        VERSION 2.0.0
         DESCRIPTION "A C++ lock-free MPMC byte stream buffer multiplexer"
         LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 20)
 
 # Options:
 option(BUILD_SLICK_STREAM_BUFFER_MULTIPLEXER_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
-find_package(slick-stream-buffer 1.0.5 CONFIG QUIET)
+find_package(slick-stream-buffer 2.0.0 CONFIG QUIET)
 
 if (NOT slick-stream-buffer_FOUND)
     include(FetchContent)
@@ -20,14 +20,14 @@ if (NOT slick-stream-buffer_FOUND)
     FetchContent_Declare(
         slick-stream-buffer
         GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer.git
-        GIT_TAG v1.0.5 # See https://github.com/SlickQuant/slick-stream-buffer/releases for latest version
+        GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-stream-buffer/releases for latest version
     )
     FetchContent_MakeAvailable(slick-stream-buffer)
 else()
-    message(STATUS "slick-stream-buffer: ${slick-stream-buffer_VERSION}")
+    message(STATUS "Found slick-stream-buffer ${slick-stream-buffer_VERSION}: ${slick-stream-buffer_DIR}")
 endif()
 
-find_package(slick-queue 1.5.0 CONFIG QUIET)
+find_package(slick-queue 2.0.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
     include(FetchContent)
@@ -37,11 +37,11 @@ if (NOT slick-queue_FOUND)
     FetchContent_Declare(
         slick-queue
         GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v1.5.0 # See https://github.com/SlickQuant/slick-queue/releases for latest version
+        GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-queue/releases for latest version
     )
     FetchContent_MakeAvailable(slick-queue)
 else()
-    message(STATUS "slick-queue: ${slick-queue_VERSION}")
+    message(STATUS "Found slick-queue ${slick-queue_VERSION}: ${slick-queue_DIR}")
 endif()
 
 add_library(slick-stream-buffer-multiplexer INTERFACE)
@@ -52,6 +52,11 @@ target_include_directories(slick-stream-buffer-multiplexer INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 set_target_properties(slick-stream-buffer-multiplexer PROPERTIES EXPORT_NAME stream_buffer_multiplexer)
+
+# The headers require C++20 (concepts, [[no_unique_address]]). This must ride on the target, not
+# on CMAKE_CXX_STANDARD: that variable applies only to targets built here, so installed consumers
+# would compile the header under whatever standard they happen to use.
+target_compile_features(slick-stream-buffer-multiplexer INTERFACE cxx_std_20)
 
 target_link_libraries(slick-stream-buffer-multiplexer INTERFACE slick::stream_buffer slick::queue)
 if(UNIX AND NOT APPLE)

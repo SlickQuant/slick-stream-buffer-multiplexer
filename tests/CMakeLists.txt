@@ -23,11 +23,10 @@ endif()
 
 target_link_libraries(slick-stream-buffer-multiplexer-tests PRIVATE slick::stream_buffer_multiplexer GTest::gtest_main)
 
-# Enable loss detection in tests
-target_compile_definitions(slick-stream-buffer-multiplexer-tests PRIVATE
-  SLICK_STREAM_BUFFER_ENABLE_LOSS_DETECTION=1
-  SLICK_QUEUE_ENABLE_LOSS_DETECTION=1
-)
+# Loss detection is no longer a macro in any of the three libraries: it is a traits parameter, so
+# the tests that assert on a counter pick it per instance (see multiplexer_test_support.hpp) and
+# report the same numbers in Debug and Release. Passing the old -D here would only emit the
+# deprecation warning each header raises for it.
 
 include(GoogleTest)
 gtest_discover_tests(slick-stream-buffer-multiplexer-tests)

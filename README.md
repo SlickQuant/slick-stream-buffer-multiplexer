@@ -52,14 +52,18 @@ returning a zero-copy view directly into that producer's ring.
   [`slick::dynamic_buffer<slick::stream_buffer_multiplexer::producer_buffer>`](https://github.com/SlickQuant/slick-dynamic-buffer) target
 - **Mix local-memory and shared-memory producers** under one multiplexer
 - **Shared memory support** for inter-process communication
+- **Opt-in diagnostics** via a `Traits` template parameter - no ODR-hazardous feature macros
 - **Cross-platform** - Windows, Linux, macOS
 - Modern **C++20**
 
 ## Requirements
 
 - C++20 compatible compiler
-- [slick-stream-buffer](https://github.com/SlickQuant/slick-stream-buffer) and
-  [slick-queue](https://github.com/SlickQuant/slick-queue) (fetched automatically when not installed)
+- CMake 3.21 or newer
+- [slick-stream-buffer](https://github.com/SlickQuant/slick-stream-buffer) >= 2.0.0 and
+  [slick-queue](https://github.com/SlickQuant/slick-queue) >= 2.0.0 (fetched automatically when
+  not installed). Both are required: v2.0.0 of this library is built on their traits-based
+  configuration.
 
 ## Installation
 
@@ -78,7 +82,7 @@ set(BUILD_SLICK_STREAM_BUFFER_MULTIPLEXER_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-stream-buffer-multiplexer
     GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer-multiplexer.git
-    GIT_TAG v1.0.0 # See https://github.com/SlickQuant/slick-stream-buffer-multiplexer/releases for latest version
+    GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-stream-buffer-multiplexer/releases for latest version
 )
 FetchContent_MakeAvailable(slick-stream-buffer-multiplexer)
 
@@ -180,15 +184,80 @@ whenever practical. The multiplexer keeps low ids on a dense lookup fast path;
 sparse or high `producer_id` values are still supported, but may fall back to a
 slower hash lookup.
 
+### Recovering a stale segment
+
+A creator that dies mid-initialization leaves its segment wedged, and constructing over that
+name reports it by throwing. Recovery is deliberately manual - nothing portable distinguishes
+a dead creator from a slow one - so clear the name first:
+
+```cpp
+slick::stream_buffer_multiplexer::remove("md_records");  // shared record queue
+slick::stream_buffer_multiplexer::remove("md_p0");       // a producer's stream_buffer
+
+slick::stream_buffer_multiplexer server(1024, "md_records");
+server.add_producer(0, 1ull << 26, 1u << 16, "md_p0");
+```
+
+One call covers both kinds of name, since both are `slick::shm` segments underneath. Only call
+it when no process is using the segment: on POSIX the name is unlinked immediately, so the next
+creator gets a fresh segment while any process still mapped to the old one keeps reading the
+orphaned copy. On Windows it is a no-op returning `true` - a section there disappears once the
+last handle closes.
+
+## Compile-time configuration
+
+`slick::stream_buffer_multiplexer` is an alias for `slick::basic_stream_buffer_multiplexer<>`.
+Its optional features are a `Traits` template parameter, not macros - and the parameter is
+[`slick::queue_traits`](https://github.com/SlickQuant/slick-queue), the traits of the shared
+record queue it is built on:
+
+```cpp
+// stock configurations - no traits struct of your own needed
+slick::basic_stream_buffer_multiplexer<slick::debug_queue_traits> counting(1024);  // counters on
+slick::basic_stream_buffer_multiplexer<slick::queue_traits>       silent(1024);    // counters off
+
+// or derive, e.g. to drop read_last() - the multiplexer never calls it, and it costs a CAS
+// per publish. Note it is part of the queue's shared-memory feature nibble, so every process
+// mapping one segment must agree.
+struct lean : slick::queue_traits {
+    static constexpr bool enable_read_last = false;
+};
+slick::basic_stream_buffer_multiplexer<lean> mux(1024);
+```
+
+The multiplexer has no traits type of its own on purpose. Everything else it exposes is a
+passthrough to that queue, and its one real tunable asks the same question
+`queue_traits::enable_loss_detection` already asks - so a separate flag would only let the two
+disagree. That matters because `multiplexer.loss_count()` **sums** the two counters: a
+half-configured pair would return a partial total that reads like a complete one. One flag,
+one number.
+
+`slick::default_queue_traits` - what the plain `stream_buffer_multiplexer` name uses - is
+`debug_queue_traits` in debug builds and `queue_traits` in release. Name a traits struct
+explicitly whenever you need the same behaviour (and the same loss numbers) out of both build
+types.
+
+> **Upgrading from 1.x.** `SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION` is ignored and
+> warns. It gated a `std::atomic` member of a header-only class, so `sizeof` differed across a
+> `-DNDEBUG` boundary: two translation units that disagreed silently violated the ODR. Because a
+> template argument is part of the mangled name, the same disagreement is now an ordinary link
+> error. `slick::stream_buffer`'s and `slick::queue`'s equivalent macros changed the same way -
+> see their READMEs for `slick::read_traits` and `slick::queue_traits`.
+
 ## API Overview
 
 ### `stream_buffer_multiplexer`
+
+Configured by a `Traits` parameter - see
+[Compile-time configuration](#compile-time-configuration).
 
 ```cpp
 // shared record queue
 explicit stream_buffer_multiplexer(uint32_t shared_queue_size);                       // local memory
 stream_buffer_multiplexer(uint32_t shared_queue_size, const char* shm_queue_name);     // shm creator
 explicit stream_buffer_multiplexer(const char* shm_queue_name);                        // shm opener
+
+static bool remove(const char* shm_name) noexcept;  // stale-segment recovery, see Shared memory usage
 
 // producer registration (single-threaded setup, before producer/consumer threads start)
 std::shared_ptr<producer_buffer> add_producer(uint32_t producer_id, uint64_t capacity, uint32_t control_size);                       // local memory
@@ -225,14 +294,14 @@ Forwards the familiar `slick::stream_buffer` producer interface, plus
 ```cpp
 std::pair<uint8_t*, size_t> prepare(size_t n);
 void commit(size_t n) noexcept;
-published_record consume(size_t n) noexcept;  // same as slick::stream_buffer::consume
+published_record consume(size_t n);           // same as slick::stream_buffer::consume; throws std::length_error at >= 4 GiB
 void discard() noexcept;
 const uint8_t* data() const noexcept;
 size_t size() const noexcept;
 
 uint64_t capacity() const noexcept;
 uint32_t control_size() const noexcept;
-uint64_t loss_count() const noexcept;          // this producer's own ring loss
+uint64_t loss_count() const noexcept;          // this producer's own ring loss; see Important Constraints
 uint64_t initial_reading_index() const noexcept;
 bool own_buffer() const noexcept;
 bool use_shm() const noexcept;
@@ -244,22 +313,38 @@ uint32_t producer_id() const noexcept;
 
 ## Important Constraints
 
-**Three independent loss counters.** `shared_queue_->loss_count()` (the shared
-record queue wrapped before a consumer read its entry), `multiplexer.loss_count()`
-(adds multiplexer-level loss: a shared-queue entry whose `producer_id` IS
-registered on this instance but whose entry was lapped by that producer's own
-ring before dereferencing), and each `producer_buffer::loss_count()` (that
-producer's own ring lapped a slow consumer). `multiplexer.loss_count()` already
-includes `shared_queue_->loss_count()`. Shared-queue entries whose `producer_id`
-is *unregistered* on this instance are silently skipped and never counted as
-loss - see [Shared memory usage](#shared-memory-usage).
+**Three independent loss counters.** `multiplexer.loss_count()` sums two of them:
+the shared record queue wrapping before a consumer read its entry, and
+multiplexer-level loss - a shared-queue entry whose `producer_id` IS registered on
+this instance but which was lapped by that producer's own ring before it could be
+dereferenced. Both are switched by `Traits::enable_loss_detection` (see
+[Compile-time configuration](#compile-time-configuration)) and read `0` when it is
+off; records are skipped correctly either way, only the counters are silent.
+Shared-queue entries whose `producer_id` is *unregistered* on this instance are
+silently skipped and never counted as loss - see
+[Shared memory usage](#shared-memory-usage).
 
-**Configurable loss detection.** Like `slick::stream_buffer` and `slick::queue`,
-the multiplexer-level loss counter compiles out when
-`SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION` is `0` (default: `1` in
-debug builds via `!defined(NDEBUG)`, `0` in release builds). When disabled,
-`multiplexer.loss_count()` returns only `shared_queue_->loss_count()`. Define
-the macro to `1`/`0` before including the header to override the default.
+The third, `producer_buffer::loss_count()`, is that producer's own ring loss, and
+the multiplexer never drives it. `read(cursor)` dereferences by jumping a fresh
+cursor to one exact sequence, where `slick::stream_buffer::read()`'s counter would
+add the whole "how far has the producer run past this record" gap on *every*
+lapped dereference and double-count wildly. It only moves for reads you make
+directly:
+
+```cpp
+struct counting : slick::read_traits { static constexpr bool count_loss = true; };
+
+uint64_t cursor = 0;
+while (p0->stream_buffer().read<counting>(cursor).first) { }
+p0->loss_count();   // what that sequential scan skipped
+```
+
+Note the two answer different questions. Over 10 records through a 4-slot control
+ring, a sequential scan lands on slot 0, finds record 8 in it and jumps there,
+recovering `{8, 9}` and reporting 8 skipped; the multiplexer asks each shared-queue
+record for its own sequence, recovers all four still resident (`{6, 7, 8, 9}`), and
+reports 6 lost. Both are right for what they measure - which is why they are not
+added together.
 
 **Pointer invalidation.** Same as `slick::stream_buffer`: `prepare()` may
 relocate the readable region, invalidating previous `data()`/`prepare()`
@@ -278,7 +363,10 @@ starting any producer or consumer threads.
 prefer contiguous `producer_id` values starting at `0`. Sparse or high ids are
 valid, but can miss the dense lookup fast path and use a hash lookup instead.
 
-**Message size** is limited to < 4 GiB per record.
+**Message size** is limited to < 4 GiB per record. `consume()` throws
+`std::length_error` rather than truncating a larger one, and throws before any state
+moves - nothing is published to the producer's ring or the shared record queue, and the
+bytes stay readable, so they can go out as several smaller records.
 
 **Power-of-2 geometry.** `shared_queue_size`, each producer's `capacity`, and
 `control_size` must all be powers of 2 (enforced by `slick::queue` and

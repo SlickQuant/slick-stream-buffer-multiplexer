@@ -2,11 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.0.0] - 2026-09-08
+
+Tracks the slick-stream-buffer and slick-queue v2.0.0 releases and applies the same fix here:
+compile-time configuration moves from macros to a Traits template parameter.
+
+### Breaking
+
+- Compile-time configuration is now a `Traits` template parameter, and that parameter is
+  `slick::queue_traits` - the traits of the shared record queue the multiplexer is built on,
+  not a traits type of its own. `slick::stream_buffer_multiplexer` is an alias for
+  `basic_stream_buffer_multiplexer<>`, so code naming `slick::stream_buffer_multiplexer`,
+  `::producer_buffer`, `::record` or `::multiplex_record` is unaffected.
+  `slick::default_queue_traits` follows `NDEBUG`, so name a traits struct explicitly to pin the
+  configuration across build types.
+- `SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION` is ignored; it warns and does nothing.
+  It gated a `std::atomic` member of a header-only class, so `sizeof` differed across a
+  `-DNDEBUG` boundary and two translation units that disagreed silently violated the ODR. A
+  template argument is part of the mangled name, so the same disagreement is now an ordinary
+  link error instead.
+- `Traits::enable_loss_detection` switches both terms of `multiplexer.loss_count()` together -
+  the shared queue's wrap loss and multiplexer-level loss - and both read 0 when it is off.
+  They are one flag rather than two because `loss_count()` sums them: a half-configured pair
+  would return a partial total that reads like a complete one. Records are skipped correctly
+  either way; only the counters are silent.
+- `producer_buffer::consume()` is no longer `noexcept`: it propagates the `std::length_error`
+  that `slick::stream_buffer::consume()` now throws for a record of 4 GiB or more. It is thrown
+  before any state moves, so nothing is published to either the producer's ring or the shared
+  record queue and the bytes stay readable.
+- `producer_buffer::loss_count()` now reads 0 unless the caller reads that producer's ring
+  through `stream_buffer().read<Traits>()` with a `Traits` whose `count_loss` is true. The
+  multiplexer's own dereference deliberately does not count: it jumps a fresh cursor to one
+  exact sequence, and `read()`'s counter measures the gap a *sequential* scan skipped, which
+  every later lapped dereference would add all over again.
+- `cmake_minimum_required` raised to 3.21 (`PROJECT_IS_TOP_LEVEL` needs it, so the stated 3.10
+  could never configure), and the C++20 requirement now travels with the target via
+  `target_compile_features(... INTERFACE cxx_std_20)` instead of `CMAKE_CXX_STANDARD`, which
+  applied only to this build and left installed consumers compiling the headers under whatever
+  standard they happened to use.
+- The installed `slick-stream-buffer-multiplexerConfig.cmake` requires its dependencies with
+  `find_dependency(... CONFIG)` instead of falling back to `FetchContent`. A config file runs
+  inside a consumer's `find_package()`, where git-cloning a dependency hides a missing install
+  behind a network fetch and can pull a different version than the one this package was
+  installed against - and the pins it carried were still v1.
 
 ### Changed
-- Expose `find_producer()` functions
-- Added Doxygen documentation for the `find_producer()` overloads.
+
+- Requires slick-stream-buffer >= 2.0.0 and slick-queue >= 2.0.0, and includes
+  `<slick/queue.hpp>` rather than the deprecated `<slick/queue.h>` shim.
+- `record` and `multiplex_record` are also spelled `slick::multiplexer_record` and
+  `slick::multiplex_record` at namespace scope, so the shared-queue element type stays one type
+  across every `Traits` configuration - two differently-configured multiplexers mapping one
+  segment must agree on it.
+- `dereference()` reads through traits with `detect_reset` off. The trait resynchronizes a
+  cursor that outlived a `reset()`; this cursor is built from the record's own sequence one
+  statement earlier and outlives nothing, and the exact-sequence check already rejects what the
+  rewind would return - so it cost an acquire load of `next_seq_` per dereference and bought no
+  accuracy.
+
+### Added
+
+- `stream_buffer_multiplexer::remove(shm_name)`, the explicit stale-segment recovery step for a
+  name a dead run left behind. One call covers both kinds of segment this class creates - the
+  shared record queue and a producer's `stream_buffer` - since both are `slick::shm` segments
+  underneath.
+- `find_producer()` overloads, public and documented.
 
 ## [1.0.1] - 2026-06-17
 

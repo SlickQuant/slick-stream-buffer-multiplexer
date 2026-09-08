@@ -1,33 +1,15 @@
 @PACKAGE_INIT@
 
-# Find dependencies
+# Find dependencies.
+#
+# CONFIG and no FetchContent fallback on purpose: this file runs inside a consumer's
+# find_package(), where silently git-cloning and building a dependency is the wrong thing to do -
+# it hides a missing install behind a network fetch and can pull a different version than the one
+# this package was built and installed against. A missing dependency is reported as a hard error
+# instead. Mirrors what slick-stream-buffer and slick-queue do in their own config files.
 include(CMakeFindDependencyMacro)
-
-find_dependency(slick-stream-buffer 1.0.5 CONFIG QUIET)
-if (NOT slick-stream-buffer_FOUND)
-    include(FetchContent)
-
-    set(BUILD_SLICK_STREAM_BUFFER_TESTS OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(
-        slick-stream-buffer
-        GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer.git
-        GIT_TAG v1.0.5
-    )
-    FetchContent_MakeAvailable(slick-stream-buffer)
-endif()
-
-find_dependency(slick-queue 1.5.0 CONFIG QUIET)
-if (NOT slick-queue_FOUND)
-    include(FetchContent)
-
-    set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(
-        slick-queue
-        GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v1.5.0
-    )
-    FetchContent_MakeAvailable(slick-queue)
-endif()
+find_dependency(slick-stream-buffer 2.0.0 CONFIG)
+find_dependency(slick-queue 2.0.0 CONFIG)
 
 include("${CMAKE_CURRENT_LIST_DIR}/slick-stream-buffer-multiplexerTargets.cmake")
 

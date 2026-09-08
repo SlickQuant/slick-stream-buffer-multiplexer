@@ -12,12 +12,14 @@
 #include <gtest/gtest.h>
 #include <slick/stream_buffer_multiplexer.hpp>
 
+#include "multiplexer_test_support.hpp"
+
 #include <atomic>
 #include <cstring>
 #include <thread>
 #include <vector>
 
-using slick::stream_buffer_multiplexer;
+using mux_test::counting_multiplexer;
 
 namespace {
 
@@ -35,7 +37,7 @@ TEST(MultiplexerMpmcTests, MultiThreadedBroadcast) {
     constexpr int kTotal = kProducers * kMessagesPerProducer;
 
     // all add_producer calls happen here, single-threaded, before any thread starts
-    stream_buffer_multiplexer mux(1024);
+    counting_multiplexer mux(1024);  // counting, so the loss_count() == 0 below has teeth in Release too
     for (uint32_t pid = 0; pid < kProducers; ++pid) {
         mux.add_producer(pid, 1 << 16, 256);
     }
@@ -106,7 +108,7 @@ TEST(MultiplexerMpmcTests, WorkStealingSharedCursor) {
     constexpr int kConsumers = 4;
     constexpr int kTotal = kProducers * kMessagesPerProducer;
 
-    stream_buffer_multiplexer mux(1024);
+    counting_multiplexer mux(1024);  // counting, so the loss_count() == 0 below has teeth in Release too
     for (uint32_t pid = 0; pid < kProducers; ++pid) {
         mux.add_producer(pid, 1 << 16, 256);
     }
@@ -169,7 +171,9 @@ TEST(MultiplexerMpmcTests, WorkStealingSharedCursor) {
 }
 
 TEST(MultiplexerMpmcTests, SharedQueueWrapCausesLoss) {
-    stream_buffer_multiplexer mux(4);                 // tiny shared queue: holds only 4 records
+    // counting_multiplexer, not the default: the shared-queue wrap counter is opt-in through
+    // Traits::shared_queue_traits, and the default configuration follows NDEBUG.
+    counting_multiplexer mux(4);                      // tiny shared queue: holds only 4 records
     auto p0 = mux.add_producer(0, 1 << 16, 256);  // generous producer ring: no inner lap
 
     for (int i = 0; i < 10; ++i) {
@@ -190,7 +194,7 @@ TEST(MultiplexerMpmcTests, SharedQueueWrapCausesLoss) {
 }
 
 TEST(MultiplexerMpmcTests, ProducerRingLapCausesMultiplexerLoss) {
-    stream_buffer_multiplexer mux(64);   // generous shared queue: no shared-queue loss
+    counting_multiplexer mux(64);        // generous shared queue: no shared-queue loss
     auto p0 = mux.add_producer(0, 1024, 4);   // tiny control ring: laps after 4 records
 
     for (int i = 0; i < 10; ++i) {
@@ -212,9 +216,5 @@ TEST(MultiplexerMpmcTests, ProducerRingLapCausesMultiplexerLoss) {
 
     // only the last 4 published records (6..9) are still present in the producer's control ring
     EXPECT_EQ(values, (std::vector<uint8_t>{6, 7, 8, 9}));
-#if SLICK_STREAM_BUFFER_MULTIPLEXER_ENABLE_LOSS_DETECTION
     EXPECT_EQ(mux.loss_count(), 6u);
-#else
-    EXPECT_EQ(mux.loss_count(), 0u);
-#endif
 }

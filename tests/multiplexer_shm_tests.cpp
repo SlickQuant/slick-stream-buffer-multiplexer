@@ -12,23 +12,13 @@
 #include <gtest/gtest.h>
 #include <slick/stream_buffer_multiplexer.hpp>
 
+#include "multiplexer_test_support.hpp"
+
 #include <cstring>
 #include <stdexcept>
 
 using slick::stream_buffer_multiplexer;
-
-namespace {
-
-void publish_message(stream_buffer_multiplexer::producer_buffer& pb, const void* src, std::size_t n) {
-    auto [ptr, sz] = pb.prepare(n);
-    ASSERT_NE(ptr, nullptr);
-    ASSERT_GE(sz, n);
-    std::memcpy(ptr, src, n);
-    pb.commit(n);
-    pb.consume(n);
-}
-
-}  // namespace
+using mux_test::publish_message;
 
 TEST(MultiplexerShmTests, ShmRoundtrip) {
     stream_buffer_multiplexer creator(64, "mux_roundtrip_records");
@@ -125,4 +115,48 @@ TEST(MultiplexerShmTests, ShmOpenerWithoutCreatorThrows) {
 
     stream_buffer_multiplexer mux(64, "mux_opener_no_producer_records");
     EXPECT_THROW(mux.add_producer(0, "mux_nonexistent_p0"), std::runtime_error);
+}
+
+// --------------------------------------------------------------------------------------------
+// v2.0.0: explicit stale-segment recovery
+// --------------------------------------------------------------------------------------------
+
+// remove() is the documented recovery step for a name a dead run left behind. The multiplexer
+// creates two kinds of segment - the shared record queue and each producer stream_buffer - and one
+// remove() covers both, since both are plain slick::shm segments underneath.
+TEST(MultiplexerShmTests, RemoveClearsBothKindsOfSegment) {
+    {
+        stream_buffer_multiplexer first(64, "mux_remove_records");
+        auto p0 = first.add_producer(0, 1024, 16, "mux_remove_p0");
+        publish_message(*p0, "stale", 5);
+    }  // last handle closed - on Windows the sections are gone here, on POSIX the names remain
+
+    EXPECT_TRUE(stream_buffer_multiplexer::remove("mux_remove_records"));
+    EXPECT_TRUE(stream_buffer_multiplexer::remove("mux_remove_p0"));
+
+    // The next creator genuinely owns what it creates, and sees none of the previous run's records.
+    stream_buffer_multiplexer second(64, "mux_remove_records");
+    auto p0 = second.add_producer(0, 1024, 16, "mux_remove_p0");
+    EXPECT_TRUE(p0->use_shm());
+
+    uint64_t cursor = second.initial_reading_index();
+    publish_message(*p0, "fresh", 5);
+
+    auto rec = second.read(cursor);
+    ASSERT_TRUE(rec);
+    EXPECT_EQ(rec.length, 5u);
+    EXPECT_EQ(std::memcmp(rec.data, "fresh", 5), 0);
+    EXPECT_FALSE(second.read(cursor));
+}
+
+// A name nothing ever created is not an error to remove - recovery code should be able to call it
+// unconditionally before creating.
+TEST(MultiplexerShmTests, RemoveIsSafeOnAnUnknownName) {
+    stream_buffer_multiplexer::remove("mux_never_created_records");  // must not throw
+
+    stream_buffer_multiplexer mux(64, "mux_never_created_records");
+    auto p0 = mux.add_producer(0, 1024, 16);
+    uint64_t cursor = 0;
+    publish_message(*p0, "ok", 2);
+    ASSERT_TRUE(mux.read(cursor));
 }
