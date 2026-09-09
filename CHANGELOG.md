@@ -26,6 +26,12 @@ compile-time configuration moves from macros to a Traits template parameter.
   They are one flag rather than two because `loss_count()` sums them: a half-configured pair
   would return a partial total that reads like a complete one. Records are skipped correctly
   either way; only the counters are silent.
+- `producer_buffer` is no longer movable; its move constructor and move assignment were public
+  and defaulted in 1.x and are now deleted. A registered producer is reachable both by the
+  `shared_ptr` `add_producer()` returns and by a raw pointer in the multiplexer's dense lookup
+  table, so moving one out emptied the `shared_ptr` members of an object both still pointed at,
+  and the next `consume()` or `read()` dereferenced a null buffer. Nothing needs to move one: it
+  is constructed in place and only ever held by `shared_ptr`.
 - `producer_buffer::consume()` is no longer `noexcept`: it propagates the `std::length_error`
   that `slick::stream_buffer::consume()` now throws for a record of 4 GiB or more. It is thrown
   before any state moves, so nothing is published to either the producer's ring or the shared
@@ -54,6 +60,11 @@ compile-time configuration moves from macros to a Traits template parameter.
   `slick::multiplex_record` at namespace scope, so the shared-queue element type stays one type
   across every `Traits` configuration - two differently-configured multiplexers mapping one
   segment must agree on it.
+- `loss_count()` is documented more precisely: only its multiplexer-level term is filtered by
+  producer registration. Shared-queue wrap loss is counted before any `producer_id` is known -
+  a lapped slot has already been overwritten - so an instance registering a subset of producers
+  sees wrap loss for producers it ignores, and the total is an upper bound on what it missed.
+  The behaviour is unchanged from 1.x; the previous wording claimed the filter applied to both.
 - `dereference()` reads through traits with `detect_reset` off. The trait resynchronizes a
   cursor that outlived a `reset()`; this cursor is built from the record's own sequence one
   statement earlier and outlives nothing, and the exact-sequence check already rejects what the
@@ -66,6 +77,10 @@ compile-time configuration moves from macros to a Traits template parameter.
   name a dead run left behind. One call covers both kinds of segment this class creates - the
   shared record queue and a producer's `stream_buffer` - since both are `slick::shm` segments
   underneath.
+- `get_producer_buffers()`, returning every registered producer keyed by `producer_id` as a
+  `const producer_map&` - the registration table itself, so enumerating allocates nothing. The
+  order is the hash map's and `const` does not propagate to the handles; the new public
+  `producer_map` alias lets callers name the type without spelling the container.
 - `find_producer()` overloads, public and documented.
 
 ## [1.0.1] - 2026-06-17

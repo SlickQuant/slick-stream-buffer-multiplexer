@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <algorithm>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -188,6 +189,19 @@ TEST(MultiplexerTests, StreamBufferAccessorTypeCompat) {
     ASSERT_NE(ptr, nullptr);
     EXPECT_EQ(len, 1u);
     EXPECT_EQ(ptr[0], 'x');
+}
+
+// A registered producer_buffer is reachable two ways at once - by shared_ptr from
+// get_producer_buffer() and by raw pointer from the multiplexer's dense lookup table - so moving
+// one out from under the multiplexer would empty the shared_ptr members of an object both still
+// point at, and the next consume() or read() would dereference a null buffer_. Nothing needs to
+// move one, so the operation does not exist.
+TEST(MultiplexerTests, ProducerBufferIsNeitherCopyableNorMovable) {
+    using pb = stream_buffer_multiplexer::producer_buffer;
+    static_assert(!std::is_move_constructible_v<pb>, "producer_buffer must not be movable");
+    static_assert(!std::is_move_assignable_v<pb>, "producer_buffer must not be move-assignable");
+    static_assert(!std::is_copy_constructible_v<pb>, "producer_buffer must not be copyable");
+    static_assert(!std::is_copy_assignable_v<pb>, "producer_buffer must not be copy-assignable");
 }
 
 TEST(MultiplexerTests, StreamBufferPtrAccessorTypeCompat) {
@@ -366,4 +380,91 @@ TEST(MultiplexerTests, OversizedConsumeThrowsAndPublishesNothing) {
     ASSERT_TRUE(delivered);
     EXPECT_EQ(delivered.length, kMaxRecord);
     EXPECT_EQ(delivered.producer_id, 0u);
+}
+
+// --------------------------------------------------------------------------------------------
+// Enumerating every registered producer
+// --------------------------------------------------------------------------------------------
+
+// Ids straddle dense_lookup_limit_ deliberately: 9000 lives only in the map, the rest are also in
+// the dense fast-path table, and the table returned here must carry every one of them exactly
+// once. Order is the hash map's and explicitly not part of the contract, so this sorts first.
+TEST(MultiplexerTests, GetProducerBuffersExposesEveryProducer) {
+    stream_buffer_multiplexer mux(64);
+    mux.add_producer(9000, 1024, 16);
+    mux.add_producer(2, 1024, 16);
+    mux.add_producer(0, 1024, 16);
+    mux.add_producer(7, 1024, 16);
+
+    const auto& all = mux.get_producer_buffers();
+    ASSERT_EQ(all.size(), mux.producer_count());
+    ASSERT_EQ(all.size(), 4u);
+
+    std::vector<uint32_t> ids;
+    for (const auto& [id, producer] : all) {
+        ASSERT_NE(producer, nullptr);
+        EXPECT_EQ(id, producer->producer_id());   // key and payload agree
+        ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    EXPECT_EQ(ids, (std::vector<uint32_t>{0, 2, 7, 9000}));
+
+    // The same objects the singular accessors hand out, not copies.
+    for (const auto& [id, producer] : all) {
+        EXPECT_EQ(producer.get(), mux.get_producer_buffer(id).get());
+        EXPECT_EQ(producer.get(), mux.find_producer(id));
+    }
+}
+
+// The point of returning the table by reference: no snapshot is built, so repeated calls hand back
+// the same object rather than an equal one.
+TEST(MultiplexerTests, GetProducerBuffersIsZeroCopy) {
+    stream_buffer_multiplexer mux(64);
+    mux.add_producer(0, 1024, 16);
+
+    EXPECT_EQ(&mux.get_producer_buffers(), &mux.get_producer_buffers());
+
+    // It tracks registrations rather than being a frozen copy.
+    EXPECT_EQ(mux.get_producer_buffers().size(), 1u);
+    mux.add_producer(1, 1024, 16);
+    EXPECT_EQ(mux.get_producer_buffers().size(), 2u);
+}
+
+TEST(MultiplexerTests, GetProducerBuffersOnEmptyMultiplexer) {
+    stream_buffer_multiplexer mux(64);
+    EXPECT_TRUE(mux.get_producer_buffers().empty());
+}
+
+// The reference dies with the multiplexer, but the shared_ptr elements do not: copy them out and
+// the producers - and the shared record queue they hold - stay alive and usable.
+TEST(MultiplexerTests, ProducersCopiedOutOfTheTableOutliveTheMultiplexer) {
+    std::vector<std::shared_ptr<stream_buffer_multiplexer::producer_buffer>> kept;
+    {
+        stream_buffer_multiplexer mux(64);
+        mux.add_producer(0, 1024, 16);
+        mux.add_producer(1, 1024, 16);
+        for (const auto& [id, producer] : mux.get_producer_buffers()) {
+            (void)id;
+            kept.push_back(producer);
+        }
+    }
+
+    ASSERT_EQ(kept.size(), 2u);
+    for (const auto& producer : kept) {
+        publish_message(*producer, "late", 4);   // consume() still works with the multiplexer gone
+    }
+}
+
+// Accessible from a const multiplexer - the usual shape for reporting code. Note const does not
+// propagate to the producers, which is the documented trade for handing back the table itself.
+TEST(MultiplexerTests, GetProducerBuffersIsAvailableOnAConstMultiplexer) {
+    stream_buffer_multiplexer mux(64);
+    mux.add_producer(3, 1024, 16);
+
+    const auto& const_mux = mux;
+    const auto& all = const_mux.get_producer_buffers();
+    static_assert(std::is_same_v<decltype(all), const stream_buffer_multiplexer::producer_map&>,
+                  "get_producer_buffers() must hand back the table by reference");
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_EQ(all.at(3)->capacity(), 1024u);
 }

@@ -15,7 +15,6 @@
 #include <slick/queue.hpp>
 
 #include <atomic>
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -135,7 +134,8 @@ struct dereference_read_traits : slick::read_traits {
  * shared memory (IPC): see add_producer() overloads and the constructors below.
  * A cross-process consumer only needs to register (via add_producer) the
  * producer ids whose shared memory it has access to; records referencing other
- * producer ids are silently skipped (not counted as loss - see loss_count()).
+ * producer ids are silently skipped, and skipping one is not itself counted as
+ * loss - though see loss_count() for what the shared-queue term cannot filter.
  *
  * @tparam Traits Compile-time feature configuration, see slick::queue_traits.
  *
@@ -146,11 +146,10 @@ struct dereference_read_traits : slick::read_traits {
  *   must be called from a single thread, same as slick::stream_buffer.
  * - loss_count() sums two counters, both switched by Traits::enable_loss_detection:
  *   the shared queue's own wrap loss and this instance's multiplexer-level loss.
- *   A third, each producer_buffer's inner-ring loss, is separate and the
- *   multiplexer's own reads never touch it - it only moves for reads the caller
- *   makes through producer_buffer::stream_buffer().read<counting_traits>().
- *   Entries whose producer_id is unregistered on this instance are never counted
- *   as loss.
+ *   Only the second is filtered by registration; see loss_count(). A third, each
+ *   producer_buffer's inner-ring loss, is separate and the multiplexer's own reads
+ *   never touch it - it only moves for reads the caller makes through
+ *   producer_buffer::stream_buffer().read<counting_traits>().
  * - A single message (one consume() call) is limited to < 4 GiB; consume() throws
  *   std::length_error rather than truncating one that is not.
  */
@@ -170,8 +169,14 @@ public:
     public:
         using published_record = slick::stream_buffer::published_record;
 
-        producer_buffer(producer_buffer&&) noexcept = default;
-        producer_buffer& operator=(producer_buffer&&) noexcept = default;
+        // Neither copyable nor movable. The multiplexer hands out shared_ptr<producer_buffer> and
+        // keeps a raw pointer to the same object in its dense lookup table, so a caller who did
+        // `auto stolen = std::move(*mux.get_producer_buffer(0));` would empty the shared_ptr
+        // members of an object both of those still point at - and the next consume() or read()
+        // would dereference a null buffer_. Nothing needs to move one: it is constructed in place
+        // and only ever held by shared_ptr.
+        producer_buffer(producer_buffer&&) = delete;
+        producer_buffer& operator=(producer_buffer&&) = delete;
         producer_buffer(const producer_buffer&) = delete;
         producer_buffer& operator=(const producer_buffer&) = delete;
 
@@ -330,6 +335,35 @@ public:
         return it == producers_.end() ? nullptr : it->second;
     }
 
+    /// The container get_producer_buffers() hands back. Named so callers that must spell the
+    /// type do not have to track the representation, which returning the table by reference
+    /// otherwise pins in place.
+    using producer_map = std::unordered_map<uint32_t, std::shared_ptr<producer_buffer>>;
+
+    /**
+     * @brief Every registered producer, keyed by producer_id.
+     *
+     * Zero-copy - this is the multiplexer's own registration table, not a snapshot. Nothing is
+     * allocated, so it is cheap enough to call in a monitoring loop. The reference stays valid
+     * until the next add_producer(), which is single-threaded setup, so in practice for the
+     * lifetime of the multiplexer; the shared_ptr elements can be copied out to outlive it.
+     *
+     * Two consequences of handing back the table rather than a copy:
+     * - Order is the hash map's - unspecified, and not stable across runs or implementations.
+     *   Sort by producer_id at the call site if a report needs a fixed sequence.
+     * - const does not propagate: a const multiplexer still yields shared_ptr<producer_buffer>,
+     *   because these are the very shared_ptrs the table holds. Use the const overloads of
+     *   get_producer_buffer() or find_producer() where a const-qualified producer matters.
+     *
+     * @code
+     * uint64_t total = 0;
+     * for (const auto& [id, producer] : mux.get_producer_buffers()) {
+     *     total += producer->loss_count();
+     * }
+     * @endcode
+     */
+    const producer_map& get_producer_buffers() const noexcept { return producers_; }
+
     /// Number of registered producers on this multiplexer instance.
     size_t producer_count() const noexcept { return producers_.size(); }
 
@@ -356,13 +390,20 @@ public:
     }
 
     /// Shared-queue wrap loss plus multiplexer-level loss (shared-queue entries whose
-    /// producer_id is registered on this instance but were lapped by that producer's
-    /// own ring before being dereferenced). Entries whose producer_id is unregistered
-    /// on this instance are silently skipped and never counted as loss.
+    /// producer_id is registered on this instance but were lapped by that producer's own ring
+    /// before being dereferenced).
+    ///
+    /// Only the second term is filtered by registration. An entry this instance actually reads
+    /// and finds to name an unregistered producer is skipped without counting - but the first
+    /// term counts entries the shared queue dropped by wrapping, and a lapped slot has already
+    /// been overwritten, so nothing is left to say which producer it named. An instance that
+    /// deliberately registers a subset of the producers therefore sees wrap loss for producers it
+    /// does not care about, making this an upper bound on what it actually missed. The loss is
+    /// not attributable after the fact by any means; size the shared queue so it does not wrap
+    /// and the term goes to 0, leaving the total exactly this instance's own loss.
     ///
     /// Both terms are switched together by Traits::enable_loss_detection and read 0 when it is
-    /// off - one flag, so this total is never partial. Records are skipped correctly either way;
-    /// only the counters are silent.
+    /// off. Records are skipped correctly either way; only the counters are silent.
     uint64_t loss_count() const noexcept {
         return shared_queue_->loss_count() + loss_count_.load(std::memory_order_relaxed);
     }
@@ -458,7 +499,7 @@ private:
     // Read-only after setup and touched by every read(), so they come first, ahead of the counter
     // below: a consumer's fetch_add on a lossy read would otherwise invalidate the line every
     // other consumer is reading the lookup tables from.
-    std::unordered_map<uint32_t, std::shared_ptr<producer_buffer>> producers_;
+    producer_map producers_;
     std::vector<producer_buffer*> dense_producers_;
     std::shared_ptr<shared_queue_type> shared_queue_;
 

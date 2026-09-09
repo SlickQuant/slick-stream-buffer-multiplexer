@@ -169,15 +169,18 @@ client.add_producer(0, "md_p0");   // producer 1 is intentionally not registered
 
 uint64_t cursor = client.initial_reading_index();
 auto rec = client.read(cursor);    // producer 0 records dereference normally;
-                                    // producer 1 records are silently skipped and
-                                    // do NOT count toward client.loss_count()
+                                    // producer 1 records are silently skipped, and
+                                    // skipping one is not itself counted as loss
 ```
 
 The `producer_id` -> shared-memory-name mapping is a caller convention (e.g. a
 shared config), not enforced by the library. Records whose `producer_id` is out
-of range or unregistered on a given multiplexer instance are silently skipped
-(not counted as loss) - this is how a consumer naturally ignores producers it
-doesn't (or can't) open.
+of range or unregistered on a given multiplexer instance are silently skipped -
+this is how a consumer naturally ignores producers it doesn't (or can't) open.
+Skipping one is not counted as loss, but note this filters only the
+multiplexer-level term of `loss_count()`; see
+[Important Constraints](#important-constraints) for what shared-queue wrap loss
+cannot attribute.
 
 For best performance, assign `producer_id` values contiguously starting at `0`
 whenever practical. The multiplexer keeps low ids on a dense lookup fast path;
@@ -266,6 +269,9 @@ std::shared_ptr<producer_buffer> add_producer(uint32_t producer_id, const char* 
 
 bool has_producer(uint32_t producer_id) const noexcept;
 std::shared_ptr<producer_buffer> get_producer_buffer(uint32_t producer_id); // shared ownership; nullptr if unregistered
+using producer_map = std::unordered_map<uint32_t, std::shared_ptr<producer_buffer>>;
+const producer_map& get_producer_buffers() const noexcept;                 // all of them, zero-copy
+producer_buffer* find_producer(uint32_t producer_id) noexcept;             // non-owning; nullptr if unregistered
 size_t producer_count() const noexcept; // number of registered producers
 
 multiplex_record read(uint64_t& cursor) noexcept;
@@ -311,6 +317,38 @@ std::shared_ptr<slick::stream_buffer> stream_buffer_ptr() noexcept;  // for slic
 uint32_t producer_id() const noexcept;
 ```
 
+### Enumerating producers
+
+`get_producer_buffers()` hands back the multiplexer's registration table by
+reference, keyed by `producer_id`. Nothing is copied or allocated, so it is cheap
+enough to call in a monitoring loop:
+
+```cpp
+uint64_t total = 0;
+for (const auto& [id, producer] : mux.get_producer_buffers()) {
+    total += producer->loss_count();   // per-producer inner-ring loss
+}
+```
+
+The reference stays valid until the next `add_producer()` - which is
+single-threaded setup, so in practice for the lifetime of the multiplexer. The
+`shared_ptr` elements carry the same ownership as `get_producer_buffer()`, so
+copying one out keeps that producer (and the shared record queue) alive
+independently of the multiplexer.
+
+Two things follow from returning the table itself rather than a snapshot:
+
+- **Order is unspecified** - it is the hash map's, and not stable across runs or
+  standard-library implementations. Sort by `producer_id` at the call site if a
+  report needs a fixed sequence.
+- **`const` does not propagate.** A `const` multiplexer still yields
+  `shared_ptr<producer_buffer>`, because these are the very handles the table
+  holds. Use `get_producer_buffer(id)` or `find_producer(id)` on a `const`
+  multiplexer where a `const`-qualified producer matters.
+
+Use `stream_buffer_multiplexer::producer_map` if you need to name the type, rather
+than spelling the container out.
+
 ## Important Constraints
 
 **Three independent loss counters.** `multiplexer.loss_count()` sums two of them:
@@ -320,9 +358,18 @@ this instance but which was lapped by that producer's own ring before it could b
 dereferenced. Both are switched by `Traits::enable_loss_detection` (see
 [Compile-time configuration](#compile-time-configuration)) and read `0` when it is
 off; records are skipped correctly either way, only the counters are silent.
-Shared-queue entries whose `producer_id` is *unregistered* on this instance are
-silently skipped and never counted as loss - see
-[Shared memory usage](#shared-memory-usage).
+
+**Only the multiplexer-level term is filtered by registration.** An entry this
+instance reads and finds to name an unregistered producer is skipped without
+counting. Shared-queue *wrap* loss cannot be filtered that way: a lapped slot has
+already been overwritten, so nothing is left to say which producer it named. A
+consumer that deliberately registers a subset of producers - see
+[Shared memory usage](#shared-memory-usage) - therefore sees wrap loss for
+producers it does not care about, and `loss_count()` is an upper bound on what it
+actually missed. Concretely: ignore producer 17, give the shared queue four slots,
+let 17 publish ten records, and `loss_count()` reports 8. No after-the-fact
+attribution is possible; size the shared queue so it does not wrap and the term
+goes to `0`, leaving the total exactly this instance's own loss.
 
 The third, `producer_buffer::loss_count()`, is that producer's own ring loss, and
 the multiplexer never drives it. `read(cursor)` dereferences by jumping a fresh
@@ -390,7 +437,7 @@ independently sized). The shared `slick::queue<record>` (`record` = `{uint64_t
 sequence; uint32_t producer_id; uint32_t pad0;}`, 16 bytes) is the lock-free MPMC
 fan-in/merge point. `read(cursor)` copies `{sequence, producer_id}` out of the
 shared queue. If `producer_id` is unregistered on this instance, the entry is
-silently skipped (not counted as loss). Otherwise it dereferences
+silently skipped (skipping is not itself counted as loss). Otherwise it dereferences
 `producers[producer_id]->stream_buffer().read(sequence)`; an exact match
 (`data != nullptr && local_cursor == sequence + 1`) returns the zero-copy view,
 otherwise the entry is counted as multiplexer-level loss. Either way, the next

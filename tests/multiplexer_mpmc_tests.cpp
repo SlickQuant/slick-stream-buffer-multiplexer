@@ -14,6 +14,7 @@
 
 #include "multiplexer_test_support.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <thread>
@@ -59,7 +60,14 @@ TEST(MultiplexerMpmcTests, MultiThreadedBroadcast) {
     }
 
     std::vector<std::thread> consumers;
-    std::vector<bool> ok(kConsumers, true);
+    // Not std::vector<bool>: it packs its elements into shared words, so two consumer threads
+    // clearing different flags would be a read-modify-write on the same word - a data race, and
+    // the one container where writing distinct elements concurrently is not safe. std::vector<int>
+    // below is fine, since its elements are distinct memory locations and the joins order them.
+    std::array<std::atomic<bool>, kConsumers> ok;
+    for (auto& flag : ok) {
+        flag.store(true, std::memory_order_relaxed);
+    }
     std::vector<int> received(kConsumers, 0);
     for (int c = 0; c < kConsumers; ++c) {
         consumers.emplace_back([&, c] {
@@ -73,13 +81,13 @@ TEST(MultiplexerMpmcTests, MultiThreadedBroadcast) {
                     continue;
                 }
                 if (rec.length != sizeof(payload) || rec.producer_id >= kProducers) {
-                    ok[c] = false;
+                    ok[c].store(false, std::memory_order_relaxed);
                     break;
                 }
                 payload data;
                 std::memcpy(&data, rec.data, sizeof(data));
                 if (data.producer_id != rec.producer_id || data.seq != expected[rec.producer_id]) {
-                    ok[c] = false;
+                    ok[c].store(false, std::memory_order_relaxed);
                     break;
                 }
                 ++expected[rec.producer_id];
@@ -93,7 +101,8 @@ TEST(MultiplexerMpmcTests, MultiThreadedBroadcast) {
     for (auto& t : consumers) t.join();
 
     for (int c = 0; c < kConsumers; ++c) {
-        EXPECT_TRUE(ok[c]) << "consumer " << c << " observed unexpected data";
+        EXPECT_TRUE(ok[c].load(std::memory_order_relaxed))
+            << "consumer " << c << " observed unexpected data";
         EXPECT_EQ(received[c], kTotal);
     }
     EXPECT_EQ(mux.loss_count(), 0u);
