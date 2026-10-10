@@ -3,14 +3,14 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(slick-stream-buffer-multiplexer
-        VERSION 2.0.0
+        VERSION 2.1.0
         DESCRIPTION "A C++ lock-free MPMC byte stream buffer multiplexer"
         LANGUAGES CXX)
 
 # Options:
 option(BUILD_SLICK_STREAM_BUFFER_MULTIPLEXER_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
-find_package(slick-stream-buffer 2.0.0 CONFIG QUIET)
+find_package(slick-stream-buffer 2.1.0 CONFIG QUIET)
 
 if (NOT slick-stream-buffer_FOUND)
     include(FetchContent)
@@ -20,14 +20,14 @@ if (NOT slick-stream-buffer_FOUND)
     FetchContent_Declare(
         slick-stream-buffer
         GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer.git
-        GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-stream-buffer/releases for latest version
+        GIT_TAG v2.1.0 # See https://github.com/SlickQuant/slick-stream-buffer/releases for latest version
     )
     FetchContent_MakeAvailable(slick-stream-buffer)
 else()
     message(STATUS "Found slick-stream-buffer ${slick-stream-buffer_VERSION}: ${slick-stream-buffer_DIR}")
 endif()
 
-find_package(slick-queue 2.0.0 CONFIG QUIET)
+find_package(slick-queue 2.3.0 CONFIG QUIET)
 
 if (NOT slick-queue_FOUND)
     include(FetchContent)
@@ -37,7 +37,7 @@ if (NOT slick-queue_FOUND)
     FetchContent_Declare(
         slick-queue
         GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-        GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-queue/releases for latest version
+        GIT_TAG v2.3.0 # See https://github.com/SlickQuant/slick-queue/releases for latest version
     )
     FetchContent_MakeAvailable(slick-queue)
 else()

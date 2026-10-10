@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2026-10-09
+
+Tracks the slick-stream-buffer v2.1.0 and slick-queue v2.3.0 releases. No code in this library
+changed; the behaviour change below arrives through the raised dependency floors.
+
+### Changed
+
+- Requires slick-stream-buffer >= 2.1.0 and slick-queue >= 2.3.0 (both were 2.0.0), in the
+  build's `find_package()` / `FetchContent` pins and in the installed config's
+  `find_dependency()` calls.
+- **Behaviour change (POSIX):** a shared-memory segment is no longer unlinked on destruction -
+  neither the shared record queue's nor a producer `stream_buffer`'s, and not even by the
+  instance that created it. Previously a creator that exited first unlinked the name while
+  consumers were still attached: they kept reading the orphaned mapping while a restarted
+  producer silently created a fresh segment under the same name, so the two never met again. A
+  restarted creator now reattaches to the existing segments and rejoins those consumers.
+- Migration: code that relied on destruction to clean up now leaves its segments in `/dev/shm`,
+  and its next run attaches to them instead of starting fresh - the shared record queue still
+  holds the old records, a producer's `own_buffer()` is `false`, and a creator passing a
+  different geometry throws. Call `stream_buffer_multiplexer::remove(name)` for every name at
+  startup to start clean, or at shutdown once no peer will attach again. It was the
+  stale-segment recovery step in 2.0.0 and is now the ordinary cleanup step too.
+- Not breaking: Windows is unaffected, since a section there already died with its last handle,
+  and neither shared-memory format changed, so 2.0 and 2.1 processes can map the same segments -
+  though a 2.0 creator still unlinks its own on exit.
+- The shared record queue keeps slick-queue's default `items_per_slot = 1` (new in slick-queue
+  2.1.0). Every publish reserves exactly one 16-byte record, so there is nothing for a wider
+  control slot to cover; raising it would only spend several records of ring per message.
+
 ## [2.0.0] - 2026-09-08
 
 Tracks the slick-stream-buffer and slick-queue v2.0.0 releases and applies the same fix here:

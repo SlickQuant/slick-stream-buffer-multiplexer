@@ -60,10 +60,10 @@ returning a zero-copy view directly into that producer's ring.
 
 - C++20 compatible compiler
 - CMake 3.21 or newer
-- [slick-stream-buffer](https://github.com/SlickQuant/slick-stream-buffer) >= 2.0.0 and
-  [slick-queue](https://github.com/SlickQuant/slick-queue) >= 2.0.0 (fetched automatically when
-  not installed). Both are required: v2.0.0 of this library is built on their traits-based
-  configuration.
+- [slick-stream-buffer](https://github.com/SlickQuant/slick-stream-buffer) >= 2.1.0 and
+  [slick-queue](https://github.com/SlickQuant/slick-queue) >= 2.3.0 (fetched automatically when
+  not installed). Both are required: this library is built on their traits-based configuration,
+  and from v2.1.0 on their shared-memory lifetime - see [Segment lifetime](#segment-lifetime).
 
 ## Installation
 
@@ -82,7 +82,7 @@ set(BUILD_SLICK_STREAM_BUFFER_MULTIPLEXER_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-stream-buffer-multiplexer
     GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer-multiplexer.git
-    GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-stream-buffer-multiplexer/releases for latest version
+    GIT_TAG v2.1.0 # See https://github.com/SlickQuant/slick-stream-buffer-multiplexer/releases for latest version
 )
 FetchContent_MakeAvailable(slick-stream-buffer-multiplexer)
 
@@ -187,11 +187,17 @@ whenever practical. The multiplexer keeps low ids on a dense lookup fast path;
 sparse or high `producer_id` values are still supported, but may fall back to a
 slower hash lookup.
 
-### Recovering a stale segment
+### Segment lifetime
 
-A creator that dies mid-initialization leaves its segment wedged, and constructing over that
-name reports it by throwing. Recovery is deliberately manual - nothing portable distinguishes
-a dead creator from a slow one - so clear the name first:
+Destroying a multiplexer or a `producer_buffer` closes its mappings but never unlinks a
+shared-memory segment - not even one it created. On POSIX a name therefore stays in `/dev/shm`
+until it is removed explicitly, and a creator that finds it attaches to the existing segment
+instead of starting fresh: the shared record queue still holds its records, a producer's
+`own_buffer()` is `false`, and a creator passing a different geometry throws. That is what lets
+a restarted producer rejoin consumers that are still attached.
+
+Whichever process coordinates the lifetime removes the names - at startup to guarantee a clean
+start, or at shutdown once no peer will attach again:
 
 ```cpp
 slick::stream_buffer_multiplexer::remove("md_records");  // shared record queue
@@ -205,7 +211,21 @@ One call covers both kinds of name, since both are `slick::shm` segments underne
 it when no process is using the segment: on POSIX the name is unlinked immediately, so the next
 creator gets a fresh segment while any process still mapped to the old one keeps reading the
 orphaned copy. On Windows it is a no-op returning `true` - a section there disappears once the
-last handle closes.
+last handle closes, so nothing outlives the processes using it.
+
+> **Upgrading from 2.0.** The creator used to unlink its segments in its destructor on POSIX.
+> A producer that exited first therefore orphaned every consumer still attached, and its restart
+> silently created a new segment under the same name that those consumers never saw. Code that
+> relied on that cleanup now leaves segments behind and attaches to them on its next run - add
+> the `remove()` calls above. The shared-memory formats are unchanged, so 2.0 and 2.1 processes
+> can map the same segments.
+
+### Recovering a stale segment
+
+A creator that dies mid-initialization leaves its segment wedged, and constructing over that
+name reports it by throwing. Recovery is the same `remove()` call, and deliberately manual -
+nothing portable distinguishes a dead creator from a slow one - so clear the name before
+creating again.
 
 ## Compile-time configuration
 
@@ -260,7 +280,7 @@ explicit stream_buffer_multiplexer(uint32_t shared_queue_size);                 
 stream_buffer_multiplexer(uint32_t shared_queue_size, const char* shm_queue_name);     // shm creator
 explicit stream_buffer_multiplexer(const char* shm_queue_name);                        // shm opener
 
-static bool remove(const char* shm_name) noexcept;  // stale-segment recovery, see Shared memory usage
+static bool remove(const char* shm_name) noexcept;  // unlink a segment name, see Segment lifetime
 
 // producer registration (single-threaded setup, before producer/consumer threads start)
 std::shared_ptr<producer_buffer> add_producer(uint32_t producer_id, uint64_t capacity, uint32_t control_size);                       // local memory

@@ -276,15 +276,19 @@ public:
     basic_stream_buffer_multiplexer& operator=(const basic_stream_buffer_multiplexer&) = delete;
 
     /**
-     * @brief Remove a shared-memory segment by name, the explicit stale-segment recovery step.
+     * @brief Remove a shared-memory segment by name: the explicit cleanup step, and the
+     *        stale-segment recovery step.
      *
      * Applies to both kinds of name this class creates - a shared record queue's and a producer
-     * stream_buffer's - since both are plain slick::shm segments underneath. Use it when a previous
-     * run died mid-initialization and left a segment wedged, which construction over that name
-     * reports by throwing:
+     * stream_buffer's - since both are plain slick::shm segments underneath. Nothing unlinks a
+     * segment on destruction, so on POSIX a name outlives every process that used it and the next
+     * creator attaches to it instead of starting fresh. Call this from whichever process
+     * coordinates the lifetime: at startup for a clean start, or at shutdown once no peer will
+     * attach again. It also clears a segment a previous run left wedged by dying
+     * mid-initialization, which construction over that name reports by throwing:
      *
      * @code
-     * slick::stream_buffer_multiplexer::remove("md_records");  // clear what a dead run left
+     * slick::stream_buffer_multiplexer::remove("md_records");  // clear what the last run left
      * slick::stream_buffer_multiplexer mux(1024, "md_records");
      * @endcode
      *
