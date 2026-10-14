@@ -97,7 +97,7 @@ set(BUILD_SLICK_STREAM_BUFFER_MULTIPLEXER_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-stream-buffer-multiplexer
     GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer-multiplexer.git
-    GIT_TAG v2.1.0 # See https://github.com/SlickQuant/slick-stream-buffer-multiplexer/releases for latest version
+    GIT_TAG v2.2.0 # See https://github.com/SlickQuant/slick-stream-buffer-multiplexer/releases for latest version
 )
 FetchContent_MakeAvailable(slick-stream-buffer-multiplexer)
 
@@ -240,7 +240,9 @@ auto rec = client.read(cursor);    // producer 0 and 2 records dereference norma
 
 Each side has to register an id as the kind it is: the record carries only
 `{sequence, producer_id}`, so the kind of ring behind an id is part of the same caller
-convention as its name.
+convention as its name. A consumer built against 2.1 or earlier has no queue producers;
+it shares the record queue with a 2.2 producer process all the same, and skips queue
+producers' records as unregistered, without counting them as loss.
 
 The `producer_id` -> shared-memory-name mapping is a caller convention (e.g. a
 shared config), not enforced by the library. Records whose `producer_id` is out
@@ -258,7 +260,7 @@ slower hash lookup.
 
 ### Segment lifetime
 
-Destroying a multiplexer or a `producer_buffer` closes its mappings but never unlinks a
+Destroying a multiplexer or a producer handle closes its mappings but never unlinks a
 shared-memory segment - not even one it created. On POSIX a name therefore stays in `/dev/shm`
 until it is removed explicitly, and a creator that finds it attaches to the existing segment
 instead of starting fresh: the shared record queue still holds its records, a producer's
@@ -403,7 +405,7 @@ uint64_t initial_reading_index() const noexcept;
 ```cpp
 struct multiplex_record {
     const uint8_t* data;
-    uint32_t length;
+    uint32_t length;        // in bytes, whichever kind of producer published it
     uint32_t producer_id;
     explicit operator bool() const noexcept;  // false if no message was available
 };
@@ -503,7 +505,8 @@ rather than spelling the containers out.
 the shared record queue wrapping before a consumer read its entry, and
 multiplexer-level loss - a shared-queue entry whose `producer_id` IS registered on
 this instance but which was lapped by that producer's own ring before it could be
-dereferenced. Both are switched by `Traits::enable_loss_detection` (see
+dereferenced (for a queue producer, also one whose bytes may already have been
+overwritten - see below). Both are switched by `Traits::enable_loss_detection` (see
 [Compile-time configuration](#compile-time-configuration)) and read `0` when it is
 off; records are skipped correctly either way, only the counters are silent.
 
@@ -632,9 +635,10 @@ dereferences into that producer's ring with a fresh cursor set to `sequence` and
 requires an exact hit: for a stream_buffer, `stream_buffer().read(sequence)` with
 `data != nullptr && local_cursor == sequence + 1`; for a queue,
 `queue().read(sequence)` with the cursor left exactly one reservation - the
-message length rounded up to `items_per_slot` - past `sequence`. A hit returns the
-zero-copy view, anything else is counted as multiplexer-level loss. Either way,
-the next shared-queue entry is tried.
+message length rounded up to `items_per_slot` - past `sequence`, and the queue's
+reservation counter no more than one ring past `sequence`, so its bytes cannot yet
+have been overwritten. A hit returns the zero-copy view, anything else is counted
+as multiplexer-level loss. Either way, the next shared-queue entry is tried.
 
 Both kinds of producer handle derive from one small non-virtual base, so the
 lookup `read()` does is the same for either: one dense table indexed by

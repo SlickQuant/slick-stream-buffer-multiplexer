@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026-10-14
+
+Adds a second kind of producer: a `slick::queue<uint8_t>` byte queue, merged into the same
+globally ordered stream as the `slick::stream_buffer` producers. Nothing existing changes
+signature, and the record and shared-memory formats are unchanged.
+
+### Added
+
+- Queue producers. `add_queue_producer()` registers a `slick::queue<uint8_t, Traits>` - the
+  multiplexer's new `queue_type`, literally `slick::queue<uint8_t>` for the default alias - in
+  local memory (with or without `items_per_slot`), as a shared-memory creator (with or without
+  `items_per_slot`) or opener, or by adopting an existing `std::shared_ptr<queue_type>`. Only
+  messages published through the returned handle are multiplexed; anything written to an adopted
+  queue directly is invisible to `read()`.
+- `producer_queue`, the queue producer's handle: `reserve()` / `operator[]` / `publish()` as in
+  `slick::queue`, with `publish()` also fanning a `{index, producer_id}` record into the shared
+  queue. Unlike a `producer_buffer`, any number of threads may publish through one. It also
+  exposes `size()`, `items_per_slot()`, `loss_count()`, `initial_reading_index()`,
+  `own_buffer()`, `use_shm()`, `queue()` and `queue_ptr()`.
+- `get_producer_queue()`, `find_producer_queue()` and `get_producer_queues()` (with the
+  `producer_queue_map` alias), the queue-producer counterparts of `get_producer_buffer()`,
+  `find_producer()` and `get_producer_buffers()`, with the same ownership and zero-copy contracts.
+- `slick::producer_kind`, and a common non-virtual `producer` base for both handles carrying
+  `producer_id()` and `kind()`. `producer_buffer` derives from it; its interface is unchanged and
+  it is still neither copyable nor movable.
+
+### Changed
+
+- `producer_id` is one namespace across both kinds: registering an id already held by either
+  kind throws `std::invalid_argument`. `has_producer()` and `producer_count()` count both kinds,
+  while `get_producer_buffer()`, `find_producer()` and `get_producer_buffers()` keep returning
+  stream_buffer producers only - `nullptr` for a queue producer's id.
+- Both kinds share one dense lookup table, so `read()` does one lookup and a branch on the kind;
+  a stream_buffer record pays that one predictable branch over 2.1. An unregistered id below the
+  dense limit (4096) now misses without falling through to a hash lookup, which makes skipping
+  unregistered producers cheaper for a consumer that registers only some of them.
+- `remove()` covers a queue producer's segment as well; it is a plain `slick::shm` segment too.
+- A consumer built against 2.1 or earlier can share a record queue with a 2.2 process. It has no
+  queue producers, so it skips their records as unregistered, without counting them as loss.
+
+### Queue producer loss
+
+- A queue message whose bytes may have been overwritten is skipped and counted, not only one
+  whose control slot was lapped. Messages differ in length, so a later reservation can cover an
+  older message's bytes without landing on its slot; once the queue's reservation counter is more
+  than one ring past a message, the message is treated as lost. The check is best-effort, as
+  `slick::stream_buffer`'s own is, and conservative: a message lying in the tail a wrapping
+  reservation skipped is reported lost although its bytes are intact.
+- `producer_queue::loss_count()` is the inner queue's own counter and is not a record count.
+  `slick::queue` configures loss detection per type, not per call, so with
+  `Traits::enable_loss_detection` on, each lapped dereference adds slick-queue's skip distance to
+  it. `multiplexer.loss_count()` remains the number to read.
+
+### Fixed
+
+- A registration that throws - `std::bad_alloc` while growing the dense lookup table - no longer
+  leaves the producer half-registered. In 2.1 the handle was inserted into the registration table
+  before the dense table grew, so a failure there still registered the producer even though the
+  call threw, and the retry was rejected as a duplicate. The dense table now grows first, so a
+  failed registration leaves nothing behind and the id can be registered again.
+
 ## [2.1.0] - 2026-10-09
 
 Tracks the slick-stream-buffer v2.1.0 and slick-queue v2.3.0 releases. No code in this library
