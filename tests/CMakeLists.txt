@@ -15,6 +15,7 @@ endif()
 add_executable(slick-stream-buffer-multiplexer-tests
   multiplexer_tests.cpp
   multiplexer_mpmc_tests.cpp
+  multiplexer_queue_tests.cpp
   multiplexer_shm_tests.cpp
 )
 if(MSVC)

@@ -311,3 +311,167 @@ TEST_F(MultiplexerShmTests, WrapLossCountsUnregisteredProducersToo) {
     // 8 counted + 2 skipped = the 10 published.
     EXPECT_EQ(opener.loss_count(), 8u);
 }
+
+// --------------------------------------------------------------------------------------------
+// slick::queue<uint8_t> producers in shared memory
+// --------------------------------------------------------------------------------------------
+
+// A queue producer's segment is self-describing like a stream_buffer's: the opener names it and
+// adopts its size and items_per_slot. The 100-byte message is longer than items_per_slot on
+// purpose - the opener can only recognize it if it rounds with the granularity it adopted.
+TEST_F(MultiplexerShmTests, ShmQueueProducerRoundtrip) {
+    stream_buffer_multiplexer creator(64, shm("mux_queue_rt_records"));
+    auto c0 = creator.add_queue_producer(0, 1024, 64, shm("mux_queue_rt_q0"));
+    auto c1 = creator.add_producer(1, 1024, 16, shm("mux_queue_rt_p1"));
+    EXPECT_TRUE(c0->use_shm());
+    EXPECT_TRUE(c0->own_buffer());
+
+    stream_buffer_multiplexer opener(shm("mux_queue_rt_records"));
+    auto o0 = opener.add_queue_producer(0, shm("mux_queue_rt_q0"));
+    opener.add_producer(1, shm("mux_queue_rt_p1"));
+
+    EXPECT_EQ(o0->size(), 1024u);
+    EXPECT_EQ(o0->items_per_slot(), 64u);
+    EXPECT_TRUE(o0->use_shm());
+    EXPECT_FALSE(o0->own_buffer());
+
+    const std::string long_message(100, 'q');
+    publish_message(*c0, "hello", 5);
+    publish_message(*c1, "world!", 6);
+    publish_message(*c0, long_message.data(), long_message.size());
+
+    uint64_t cursor = 0;
+    auto r0 = opener.read(cursor);
+    ASSERT_TRUE(r0);
+    EXPECT_EQ(r0.producer_id, 0u);
+    EXPECT_EQ(r0.length, 5u);
+    EXPECT_EQ(std::memcmp(r0.data, "hello", 5), 0);
+
+    auto r1 = opener.read(cursor);
+    ASSERT_TRUE(r1);
+    EXPECT_EQ(r1.producer_id, 1u);
+    EXPECT_EQ(r1.length, 6u);
+    EXPECT_EQ(std::memcmp(r1.data, "world!", 6), 0);
+
+    auto r2 = opener.read(cursor);
+    ASSERT_TRUE(r2);
+    EXPECT_EQ(r2.producer_id, 0u);
+    EXPECT_EQ(r2.length, 100u);
+    EXPECT_EQ(std::memcmp(r2.data, long_message.data(), long_message.size()), 0);
+
+    EXPECT_FALSE(opener.read(cursor));
+    EXPECT_EQ(opener.loss_count(), 0u);
+}
+
+// The partial-visibility rule does not care which kind the unregistered producer is.
+TEST_F(MultiplexerShmTests, ShmPartialQueueProducerVisibility) {
+    stream_buffer_multiplexer creator(64, shm("mux_queue_partial_records"));
+    auto c0 = creator.add_queue_producer(0, 1024, 16, shm("mux_queue_partial_q0"));
+    auto c1 = creator.add_queue_producer(1, 1024, 16);  // local-only - not visible to the opener
+
+    stream_buffer_multiplexer opener(shm("mux_queue_partial_records"));
+    opener.add_queue_producer(0, shm("mux_queue_partial_q0"));
+    EXPECT_TRUE(opener.has_producer(0));
+    EXPECT_FALSE(opener.has_producer(1));
+
+    publish_message(*c0, "aaa", 3);
+    publish_message(*c1, "bbbb", 4);
+    publish_message(*c0, "ccccc", 5);
+
+    uint64_t cursor = 0;
+
+    auto r0 = opener.read(cursor);
+    ASSERT_TRUE(r0);
+    EXPECT_EQ(r0.producer_id, 0u);
+    EXPECT_EQ(r0.length, 3u);
+    EXPECT_EQ(std::memcmp(r0.data, "aaa", 3), 0);
+
+    // producer 1's record is unregistered on the opener side -> silently skipped, not loss
+    auto r1 = opener.read(cursor);
+    ASSERT_TRUE(r1);
+    EXPECT_EQ(r1.producer_id, 0u);
+    EXPECT_EQ(r1.length, 5u);
+    EXPECT_EQ(std::memcmp(r1.data, "ccccc", 5), 0);
+
+    EXPECT_FALSE(opener.read(cursor));
+    EXPECT_EQ(opener.loss_count(), 0u);
+}
+
+TEST_F(MultiplexerShmTests, ShmQueueProducerMismatchThrows) {
+    stream_buffer_multiplexer creator(64, shm("mux_queue_geo_records"));
+    creator.add_queue_producer(0, 1024, 64, shm("mux_queue_geo_q0"));
+
+    // a second "creator" over the same name with a different size, then a different granularity
+    stream_buffer_multiplexer other(64, shm("mux_queue_geo_records2"));
+    EXPECT_THROW(other.add_queue_producer(0, 2048, 64, shm("mux_queue_geo_q0")), std::runtime_error);
+    EXPECT_THROW(other.add_queue_producer(0, 1024, 16, shm("mux_queue_geo_q0")), std::runtime_error);
+
+    // an opener with no creator
+    EXPECT_THROW(other.add_queue_producer(0, shm("mux_queue_nonexistent_q0")), std::runtime_error);
+    EXPECT_FALSE(other.has_producer(0));
+}
+
+// remove() covers a queue producer's segment as it does the other two kinds: after it, a creator
+// over the same name gets a segment it owns, carrying none of the previous run's bytes.
+TEST_F(MultiplexerShmTests, RemoveClearsAQueueProducerSegment) {
+    {
+        stream_buffer_multiplexer first(64, shm("mux_queue_remove_records"));
+        auto q0 = first.add_queue_producer(0, 1024, 64, shm("mux_queue_remove_q0"));
+        publish_message(*q0, "stale", 5);
+    }
+
+    EXPECT_TRUE(stream_buffer_multiplexer::remove(shm("mux_queue_remove_records")));
+    EXPECT_TRUE(stream_buffer_multiplexer::remove(shm("mux_queue_remove_q0")));
+
+    stream_buffer_multiplexer second(64, shm("mux_queue_remove_records"));
+    auto q0 = second.add_queue_producer(0, 1024, 64, shm("mux_queue_remove_q0"));
+    EXPECT_TRUE(q0->use_shm());
+    EXPECT_TRUE(q0->own_buffer());              // a fresh segment, not an attach to the old one
+    EXPECT_EQ(q0->initial_reading_index(), 0u);  // and nothing reserved in it yet
+
+    uint64_t cursor = second.initial_reading_index();
+    publish_message(*q0, "fresh", 5);
+
+    auto rec = second.read(cursor);
+    ASSERT_TRUE(rec);
+    EXPECT_EQ(rec.length, 5u);
+    EXPECT_EQ(std::memcmp(rec.data, "fresh", 5), 0);
+    EXPECT_FALSE(second.read(cursor));
+}
+
+// The queue counterpart of RestartedCreatorRejoinsAttachedConsumer: the restarted creator attaches
+// to the surviving queue segment and carries on from its reservation index, so a consumer that
+// stayed attached sees what was published on both sides of the restart.
+TEST_F(MultiplexerShmTests, RestartedCreatorRejoinsAttachedQueueConsumer) {
+    auto first = std::make_unique<stream_buffer_multiplexer>(64, shm("mux_queue_restart_records"));
+    auto q0 = first->add_queue_producer(0, 1024, 64, shm("mux_queue_restart_q0"));
+
+    stream_buffer_multiplexer consumer(shm("mux_queue_restart_records"));
+    consumer.add_queue_producer(0, shm("mux_queue_restart_q0"));
+    uint64_t cursor = consumer.initial_reading_index();
+
+    publish_message(*q0, "before", 6);
+
+    // The creator exits: the producer handle shares ownership of both segments, so it goes too.
+    q0.reset();
+    first.reset();
+
+    stream_buffer_multiplexer second(64, shm("mux_queue_restart_records"));
+    auto restarted = second.add_queue_producer(0, 1024, 64, shm("mux_queue_restart_q0"));
+    EXPECT_FALSE(restarted->own_buffer());  // attached to the surviving segment, not a fresh one
+
+    publish_message(*restarted, "after!!", 7);
+
+    auto r0 = consumer.read(cursor);
+    ASSERT_TRUE(r0);
+    EXPECT_EQ(r0.length, 6u);
+    EXPECT_EQ(std::memcmp(r0.data, "before", 6), 0);
+
+    auto r1 = consumer.read(cursor);
+    ASSERT_TRUE(r1);
+    EXPECT_EQ(r1.producer_id, 0u);
+    EXPECT_EQ(r1.length, 7u);
+    EXPECT_EQ(std::memcmp(r1.data, "after!!", 7), 0);
+
+    EXPECT_FALSE(consumer.read(cursor));
+}

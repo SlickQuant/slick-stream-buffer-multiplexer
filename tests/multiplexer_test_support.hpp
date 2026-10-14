@@ -37,23 +37,32 @@ struct counting_read_traits : slick::read_traits {
     static constexpr bool count_loss = true;
 };
 
-/// prepare + write + commit + consume in one step.
-template <typename ProducerBuffer>
-void publish_message(ProducerBuffer& pb, const void* src, std::size_t n) {
-    auto [ptr, sz] = pb.prepare(n);
-    ASSERT_NE(ptr, nullptr);
-    ASSERT_GE(sz, n);
-    std::memcpy(ptr, src, n);
-    pb.commit(n);
-    pb.consume(n);
+/// Publish one message through either kind of producer handle in one step: reserve + write +
+/// publish for a producer_queue, prepare + write + commit + consume for a producer_buffer. One
+/// name for both so a test reads the same whichever ring is underneath.
+template <typename Producer>
+void publish_message(Producer& producer, const void* src, std::size_t n) {
+    if constexpr (requires { producer.reserve(1u); }) {
+        const auto size = static_cast<uint32_t>(n);
+        const uint64_t index = producer.reserve(size);
+        std::memcpy(producer[index], src, n);
+        producer.publish(index, size);
+    } else {
+        auto [ptr, sz] = producer.prepare(n);
+        ASSERT_NE(ptr, nullptr);
+        ASSERT_GE(sz, n);
+        std::memcpy(ptr, src, n);
+        producer.commit(n);
+        producer.consume(n);
+    }
 }
 
 /// Publish `count` single-byte messages numbered 0, 1, 2, ... - enough to lap a small ring.
-template <typename ProducerBuffer>
-void publish_bytes(ProducerBuffer& pb, int count) {
+template <typename Producer>
+void publish_bytes(Producer& producer, int count) {
     for (int i = 0; i < count; ++i) {
         const auto value = static_cast<uint8_t>(i);
-        publish_message(pb, &value, 1);
+        publish_message(producer, &value, 1);
     }
 }
 

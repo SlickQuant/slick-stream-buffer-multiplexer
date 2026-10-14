@@ -227,3 +227,155 @@ TEST(MultiplexerMpmcTests, ProducerRingLapCausesMultiplexerLoss) {
     EXPECT_EQ(values, (std::vector<uint8_t>{6, 7, 8, 9}));
     EXPECT_EQ(mux.loss_count(), 6u);
 }
+
+// --------------------------------------------------------------------------------------------
+// slick::queue<uint8_t> producers
+// --------------------------------------------------------------------------------------------
+
+// What a producer_queue allows and a producer_buffer does not: several threads publishing through
+// one handle. They share producer id 0, so the payload carries the writer; a stream_buffer
+// producer runs alongside to mix the two kinds under contention. Each writer's own messages have
+// to arrive in the order it published them, and nothing may be lost or duplicated.
+TEST(MultiplexerMpmcTests, ManyThreadsShareOneQueueProducer) {
+    constexpr uint32_t kQueueWriters = 4;
+    constexpr uint32_t kWriters = kQueueWriters + 1;  // the last one drives the stream_buffer producer
+    constexpr int kMessagesPerWriter = 200;
+    constexpr int kConsumers = 3;
+    constexpr int kTotal = kWriters * kMessagesPerWriter;
+
+    counting_multiplexer mux(2048);
+    auto shared = mux.add_queue_producer(0, 1 << 16, sizeof(payload));  // one control slot per message
+    auto stream = mux.add_producer(1, 1 << 16, 256);
+
+    std::vector<std::thread> writers;
+    for (uint32_t writer = 0; writer < kWriters; ++writer) {
+        writers.emplace_back([&, writer] {
+            for (uint64_t seq = 0; seq < kMessagesPerWriter; ++seq) {
+                const payload data{writer, seq};
+                if (writer < kQueueWriters) {
+                    mux_test::publish_message(*shared, &data, sizeof(data));
+                } else {
+                    mux_test::publish_message(*stream, &data, sizeof(data));
+                }
+            }
+        });
+    }
+
+    std::array<std::atomic<bool>, kConsumers> ok;
+    for (auto& flag : ok) {
+        flag.store(true, std::memory_order_relaxed);
+    }
+    std::vector<int> received(kConsumers, 0);
+    std::vector<std::thread> consumers;
+    for (int c = 0; c < kConsumers; ++c) {
+        consumers.emplace_back([&, c] {
+            uint64_t cursor = 0;
+            std::vector<uint64_t> expected(kWriters, 0);
+            int count = 0;
+            while (count < kTotal) {
+                auto rec = mux.read(cursor);
+                if (!rec) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                payload data{};
+                if (rec.length == sizeof(payload)) {
+                    std::memcpy(&data, rec.data, sizeof(data));
+                }
+                const uint32_t want_producer = data.producer_id < kQueueWriters ? 0u : 1u;
+                if (rec.length != sizeof(payload) || data.producer_id >= kWriters ||
+                    rec.producer_id != want_producer || data.seq != expected[data.producer_id]) {
+                    ok[c].store(false, std::memory_order_relaxed);
+                    break;
+                }
+                ++expected[data.producer_id];
+                ++count;
+            }
+            received[c] = count;
+        });
+    }
+
+    for (auto& t : writers) t.join();
+    for (auto& t : consumers) t.join();
+
+    for (int c = 0; c < kConsumers; ++c) {
+        EXPECT_TRUE(ok[c].load(std::memory_order_relaxed))
+            << "consumer " << c << " observed unexpected data";
+        EXPECT_EQ(received[c], kTotal);
+    }
+    EXPECT_EQ(mux.loss_count(), 0u);
+    EXPECT_EQ(shared->loss_count(), 0u);  // the ring never lapped, so no dereference found one
+}
+
+// A shared atomic cursor hands each message to exactly one consumer, whichever kind of producer
+// it came from.
+TEST(MultiplexerMpmcTests, WorkStealingSharedCursorOverMixedProducers) {
+    constexpr uint32_t kProducers = 4;  // even ids are queue producers, odd ids stream_buffer ones
+    constexpr int kMessagesPerProducer = 150;
+    constexpr int kConsumers = 4;
+    constexpr int kTotal = kProducers * kMessagesPerProducer;
+
+    counting_multiplexer mux(1024);
+    for (uint32_t pid = 0; pid < kProducers; ++pid) {
+        if (pid % 2 == 0) {
+            mux.add_queue_producer(pid, 1 << 16, sizeof(payload));
+        } else {
+            mux.add_producer(pid, 1 << 16, 256);
+        }
+    }
+
+    std::vector<std::thread> producers;
+    for (uint32_t pid = 0; pid < kProducers; ++pid) {
+        producers.emplace_back([&mux, pid] {
+            for (uint64_t seq = 0; seq < kMessagesPerProducer; ++seq) {
+                const payload data{pid, seq};
+                if (pid % 2 == 0) {
+                    mux_test::publish_message(*mux.find_producer_queue(pid), &data, sizeof(data));
+                } else {
+                    mux_test::publish_message(*mux.find_producer(pid), &data, sizeof(data));
+                }
+            }
+        });
+    }
+    for (auto& t : producers) t.join();
+
+    std::atomic<uint64_t> shared_cursor{0};
+    std::atomic<int> total_count{0};
+    std::vector<std::vector<uint64_t>> seen(kConsumers);
+
+    std::vector<std::thread> consumers;
+    for (int c = 0; c < kConsumers; ++c) {
+        consumers.emplace_back([&, c] {
+            for (;;) {
+                if (total_count.load(std::memory_order_relaxed) >= kTotal) break;
+                auto rec = mux.read(shared_cursor);
+                if (!rec) {
+                    if (total_count.load(std::memory_order_relaxed) >= kTotal) break;
+                    std::this_thread::yield();
+                    continue;
+                }
+                ASSERT_EQ(rec.length, sizeof(payload));
+                payload data;
+                std::memcpy(&data, rec.data, sizeof(data));
+                ASSERT_EQ(data.producer_id, rec.producer_id);
+                seen[c].push_back(data.producer_id * static_cast<uint64_t>(kMessagesPerProducer) + data.seq);
+                total_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& t : consumers) t.join();
+
+    std::vector<int> union_count(kTotal, 0);
+    int total = 0;
+    for (auto& v : seen) {
+        for (auto idx : v) {
+            ++union_count[idx];
+            ++total;
+        }
+    }
+    EXPECT_EQ(total, kTotal);
+    for (int i = 0; i < kTotal; ++i) {
+        EXPECT_EQ(union_count[i], 1) << "global index " << i;
+    }
+    EXPECT_EQ(mux.loss_count(), 0u);
+}
